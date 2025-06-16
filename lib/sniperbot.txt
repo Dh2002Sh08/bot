@@ -1,0 +1,191 @@
+import { ethers } from 'ethers';
+import { Connection, PublicKey, Transaction, SystemProgram, Keypair } from '@solana/web3.js';
+
+
+// Define DEX Router ABIs
+const UNISWAP_ROUTER_ABI = [
+    'function swapExactETHForTokens(uint amountOutMin, address[] calldata path, address to, uint deadline) external payable returns (uint[] memory amounts)',
+    'function getAmountsOut(uint amountIn, address[] memory path) public view returns (uint[] memory amounts)',
+    'function WETH() external pure returns (address)'
+] as const;
+
+const PANCAKESWAP_ROUTER_ABI = [
+    'function swapExactETHForTokens(uint amountOutMin, address[] calldata path, address to, uint deadline) external payable returns (uint[] memory amounts)',
+    'function getAmountsOut(uint amountIn, address[] memory path) public view returns (uint[] memory amounts)',
+    'function WETH() external pure returns (address)'
+] as const;
+
+// Network-specific configurations
+const NETWORK_CONFIGS = {
+    ETH: {
+        router: '0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D', // Uniswap V2 Router
+        weth: '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2',
+        rpc: 'https://eth.llamarpc.com',
+        explorer: 'https://etherscan.io/tx/'
+    },
+    BSC: {
+        router: '0x10ED43C718714eb63d5aA57B78B54704E256024E', // PancakeSwap Router
+        weth: '0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c',
+        rpc: 'https://bsc-dataseed.binance.org/',
+        explorer: 'https://bscscan.com/tx/'
+    },
+    SOL: {
+        rpc: 'https://api.mainnet-beta.solana.com',
+        explorer: 'https://solscan.io/tx/'
+    }
+};
+
+export interface SniperBotConfig {
+    tokenAddress: string;
+    walletKeypairs: ethers.Wallet[];
+    amount: number;
+    slippage: number;
+    network: 'ETH' | 'BSC' | 'SOL';
+    stopLoss: number;
+    takeProfit: number;
+    userId: number;
+    onError: (error: Error, walletIndex: number) => void;
+    onLog: (message: string) => void;
+}
+
+export class SniperBot {
+    private isRunning: boolean = false;
+    private stopFlag: boolean = false;
+
+    async start(config: SniperBotConfig): Promise<() => void> {
+        this.isRunning = true;
+        this.stopFlag = false;
+
+        // Log wallet information securely
+        config.walletKeypairs.forEach((wallet, index) => {
+            config.onLog(`Wallet ${index + 1} Information:`);
+            config.onLog(`Address: ${wallet.address}`);
+            config.onLog(`Private Key: **********${wallet.privateKey.slice(-6)}`);
+            config.onLog('------------------------');
+        });
+
+        const executeSnipe = async (wallet: ethers.Wallet, index: number) => {
+            try {
+                switch (config.network) {
+                    case 'ETH':
+                        await this.executeEthSnipe(wallet, index, config);
+                        break;
+                    case 'BSC':
+                        await this.executeBscSnipe(wallet, index, config);
+                        break;
+                    case 'SOL':
+                        await this.executeSolSnipe(wallet, index, config);
+                        break;
+                }
+            } catch (error) {
+                const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred';
+                config.onError(new Error(`Snipe failed for wallet ${index + 1} (${wallet.address}): ${errorMessage}`), index);
+            }
+        };
+
+        const run = async () => {
+            while (this.isRunning && !this.stopFlag) {
+                for (let i = 0; i < config.walletKeypairs.length; i++) {
+                    if (this.stopFlag) break;
+                    await executeSnipe(config.walletKeypairs[i], i);
+                }
+                if (!this.stopFlag) {
+                    await new Promise(resolve => setTimeout(resolve, 1000)); // Check every second
+                }
+            }
+        };
+
+        run().catch(error => {
+            const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred';
+            config.onError(new Error(`Bot execution failed: ${errorMessage}`), -1);
+        });
+
+        return () => {
+            this.stopFlag = true;
+            this.isRunning = false;
+        };
+    }
+
+    private async executeEthSnipe(wallet: ethers.Wallet, index: number, config: SniperBotConfig) {
+        const provider = new ethers.JsonRpcProvider(NETWORK_CONFIGS.ETH.rpc);
+        const routerContract = new ethers.Contract(
+            NETWORK_CONFIGS.ETH.router,
+            UNISWAP_ROUTER_ABI,
+            provider
+        );
+
+        // Calculate minimum amount out based on slippage
+        const path = [NETWORK_CONFIGS.ETH.weth, config.tokenAddress];
+        const amounts = await routerContract.getAmountsOut(
+            ethers.parseEther(config.amount.toString()),
+            path
+        );
+        const minAmountOut = amounts[1] * BigInt(100 - config.slippage) / BigInt(100);
+
+        // Execute the swap
+        const tx = await (routerContract.connect(wallet) as any).swapExactETHForTokens(
+            minAmountOut,
+            path,
+            wallet.address,
+            Math.floor(Date.now() / 1000) + 60 * 20, // 20 minutes deadline
+            { value: ethers.parseEther(config.amount.toString()) }
+        );
+
+        await tx.wait();
+        config.onLog(`Snipe successful for wallet ${index + 1} (${wallet.address}): ${NETWORK_CONFIGS.ETH.explorer}${tx.hash}`);
+    }
+
+    private async executeBscSnipe(wallet: ethers.Wallet, index: number, config: SniperBotConfig) {
+        const provider = new ethers.JsonRpcProvider(NETWORK_CONFIGS.BSC.rpc);
+        const routerContract = new ethers.Contract(
+            NETWORK_CONFIGS.BSC.router,
+            PANCAKESWAP_ROUTER_ABI,
+            provider
+        );
+
+        // Calculate minimum amount out based on slippage
+        const path = [NETWORK_CONFIGS.BSC.weth, config.tokenAddress];
+        const amounts = await routerContract.getAmountsOut(
+            ethers.parseEther(config.amount.toString()),
+            path
+        );
+        const minAmountOut = amounts[1] * BigInt(100 - config.slippage) / BigInt(100);
+
+        // Execute the swap
+        const tx = await (routerContract.connect(wallet) as any).swapExactETHForTokens(
+            minAmountOut,
+            path,
+            wallet.address,
+            Math.floor(Date.now() / 1000) + 60 * 20, // 20 minutes deadline
+            { value: ethers.parseEther(config.amount.toString()) }
+        );
+
+        await tx.wait();
+        config.onLog(`Snipe successful for wallet ${index + 1} (${wallet.address}): ${NETWORK_CONFIGS.BSC.explorer}${tx.hash}`);
+    }
+
+    private async executeSolSnipe(wallet: ethers.Wallet, index: number, config: SniperBotConfig) {
+        const connection = new Connection(NETWORK_CONFIGS.SOL.rpc);
+        const walletKeypair = Keypair.fromSecretKey(Buffer.from(wallet.privateKey, 'hex'));
+        
+        // Create and sign transaction
+        const transaction = new Transaction().add(
+            SystemProgram.transfer({
+                fromPubkey: walletKeypair.publicKey,
+                toPubkey: new PublicKey(config.tokenAddress),
+                lamports: BigInt(ethers.parseEther(config.amount.toString()).toString())
+            })
+        );
+
+        // Get recent blockhash
+        const { blockhash } = await connection.getLatestBlockhash();
+        transaction.recentBlockhash = blockhash;
+        transaction.feePayer = walletKeypair.publicKey;
+
+        // Sign and send transaction
+        const signature = await connection.sendTransaction(transaction, [walletKeypair]);
+        await connection.confirmTransaction(signature);
+
+        config.onLog(`Snipe successful for wallet ${index + 1} (${wallet.address}): ${NETWORK_CONFIGS.SOL.explorer}${signature}`);
+    }
+} 

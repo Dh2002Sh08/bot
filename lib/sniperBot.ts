@@ -1,49 +1,42 @@
 // sniperBot.ts - Enhanced Telegram Sniper Bot
 
 import { ethers, TransactionResponse } from 'ethers';
-import { Connection, PublicKey, Transaction, SystemProgram, Keypair } from '@solana/web3.js';
+import { Connection, PublicKey, Transaction, SystemProgram, Keypair, ParsedAccountData } from '@solana/web3.js';
+import { Liquidity, LiquidityPoolInfo, Token, TokenAmount, Percent, CurrencyAmount } from '@raydium-io/raydium-sdk';
+import { deserializeMetadata } from '@metaplex-foundation/mpl-token-metadata';
+import { WSOL_ADDRESS } from './constants';
 // Removed SNIPER_BOT_ABI, SNIPER_BOT_ADDRESS, BSC_SNIPER_BOT_ADDRESS if not used internally by SniperBot class
 import dotenv from 'dotenv';
+import { UNISWAP_ROUTER_ABI } from '../Address/uniswapRouterABI';
+import { PANCAKESWAP_ROUTER_ABI } from '../Address/pancakeswapRouterABI';
+import { tokenScanner } from './tokenScanner';
 // Removed Telegraf, Markup, Scenes, session, message imports
+import { RaydiumSwap } from './raydiumSwap';
+import { VersionedTransaction } from '@solana/web3.js';
 
 dotenv.config();
-
-// Removed MySession and MyContext interfaces
-
-// Define DEX Router ABIs (kept as they are core to sniping logic)
-export const UNISWAP_ROUTER_ABI = [
-    'function swapExactETHForTokens(uint amountOutMin, address[] calldata path, address to, uint deadline) external payable returns (uint[] memory amounts)',
-    'function getAmountsOut(uint amountIn, address[] memory path) public view returns (uint[] memory amounts)',
-    'function WETH() external pure returns (address)',
-    'function swapExactTokensForETH(uint amountIn, uint amountOutMin, address[] calldata path, address to, uint deadline) external returns (uint[] memory amounts)'
-] as const;
-
-export const PANCAKESWAP_ROUTER_ABI = [
-    'function swapExactETHForTokens(uint amountOutMin, address[] calldata path, address to, uint deadline) external payable returns (uint[] memory amounts)',
-    'function getAmountsOut(uint amountIn, address[] memory path) public view returns (uint[] memory amounts)',
-    'function WETH() external pure returns (address)',
-    'function swapExactTokensForETH(uint amountIn, uint amountOutMin, address[] calldata path, address to, uint deadline) external returns (uint[] memory amounts)'
-] as const;
 
 // Network-specific configurations (kept as they are core to sniping logic)
 export const NETWORK_CONFIGS = {
     ETH: {
         router: '0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D', // Uniswap V2 Router
         weth: '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2',
-        rpc: 'https://eth.llamarpc.com',
+        rpc: `https://aged-cosmological-mound.quiknode.pro/${process.env.QUICKNODE_KEY}`,
         explorer: 'https://etherscan.io/tx/',
         factory: '0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f'
     },
     BSC: {
         router: '0x10ED43C718714eb63d5aA57B78B54704E256024E', // PancakeSwap Router
         weth: '0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c',
-        rpc: 'https://bsc-dataseed.binance.org/',
+        rpc: `https://aged-cosmological-mound.bsc.quiknode.pro/${process.env.QUICKNODE_KEY}`,
         explorer: 'https://bscscan.com/tx/',
         factory: '0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73'
     },
     SOL: {
-        rpc: 'https://api.mainnet-beta.solana.com',
-        explorer: 'https://solscan.io/tx/'
+        router: 'routeUGWgWzqBWFcrCfv8tritsqukccJPu3q5GPP3xS', // Raydium AMM Pool
+        rpc: `https://rpc.shyft.to?api_key=${process.env.SHYFT_KEY}`,
+        explorer: 'https://solscan.io/tx/',
+        factory: '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8' // Raydium Program ID for pool creation
     }
 } as const;
 
@@ -55,8 +48,8 @@ export interface SniperBotConfig {
     slippage: number;
     stopLoss: number;
     takeProfit: number;
-    onError: (error: Error, userId: number) => void;
-    onLog: (message: string, userId: number) => void;
+    onLog: (msg: string, userId: number, messageId?: number, deleteMessage?: boolean) => Promise<number>;
+    onError: (error: Error, userId: number) => Promise<void>;
 }
 
 interface TokenPosition {
@@ -68,26 +61,95 @@ interface TokenPosition {
     network: 'ETH' | 'BSC' | 'SOL';
 }
 
+interface JupiterPriceResponse {
+    data: {
+        [key: string]: {
+            price: number;
+        };
+    };
+}
+
+interface BirdeyePriceResponse {
+    success: boolean;
+    data: {
+        value: number;
+    };
+}
+
 export class SniperBot {
     private isRunning: boolean = false;
     private stopFlag: boolean = false;
     private positions: Map<string, TokenPosition> = new Map();
     private userWallets: Map<number, Map<'ETH' | 'BSC' | 'SOL', any>> = new Map();
     private monitoringIntervals: Map<number, NodeJS.Timeout> = new Map(); // Track intervals per user
-    
-    // Global bot configuration initialized in constructor
     private botConfig: SniperBotConfig;
+    private userConfigs: Map<number, SniperBotConfig> = new Map(); // Store user-specific configs
+    private balanceUpdateIntervals: Map<number, NodeJS.Timeout> = new Map();
+    private lastBalanceMessages: Map<number, number> = new Map();
 
     constructor(config: SniperBotConfig) {
         this.botConfig = config;
     }
 
+    // Add public getter methods for callbacks
+    getErrorCallback() {
+        return this.botConfig.onError;
+    }
+
+    getLogCallback() {
+        return this.botConfig.onLog;
+    }
+
+    // Add user configuration methods
+    updateUserConfig(userId: number, config: SniperBotConfig) {
+        this.userConfigs.set(userId, config);
+    }
+
+    getUserConfig(userId: number): SniperBotConfig | undefined {
+        return this.userConfigs.get(userId);
+    }
+
     // --- Wallet Management ---
+    private async updateWalletBalances(userId: number, network?: 'ETH' | 'BSC' | 'SOL') {
+        try {
+            const balances = [];
+            const networks = network ? [network] : ['ETH', 'BSC', 'SOL'] as const;
+            
+            for (const net of networks) {
+                if (this.hasUserWallet(userId, net)) {
+                    const balance = await this.getWalletBalance(userId, net);
+                    const emoji = net === 'ETH' ? '🔷' : net === 'BSC' ? '🟡' : '🟣';
+                    balances.push(`${emoji} ${net}: ${balance}`);
+                }
+            }
+
+            if (balances.length > 0) {
+                const message = `💰 Wallet Balances:\n${balances.join('\n')}`;
+                
+                // Delete previous balance message if it exists
+                const lastMessageId = this.lastBalanceMessages.get(userId);
+                if (lastMessageId) {
+                    try {
+                        await this.botConfig.onLog('', userId, lastMessageId, true); // Delete previous message
+                    } catch (error) {
+                        console.error('Error deleting previous balance message:', error);
+                    }
+                }
+
+                // Send new balance message and store its ID
+                const newMessageId = await this.botConfig.onLog(message, userId);
+                this.lastBalanceMessages.set(userId, newMessageId);
+            }
+        } catch (error) {
+            console.error('Error updating wallet balances:', error);
+        }
+    }
+
     setUserWallet(userId: number, network: 'ETH' | 'BSC' | 'SOL', privateKey: string) {
         if (!this.userWallets.has(userId)) {
             this.userWallets.set(userId, new Map());
         }
-        
+
         if (network === 'SOL') {
             // For Solana, create a keypair from the stored secret key
             const secretKey = new Uint8Array(Buffer.from(privateKey, 'hex'));
@@ -106,6 +168,9 @@ export class SniperBot {
             const provider = new ethers.JsonRpcProvider(NETWORK_CONFIGS[network].rpc);
             this.userWallets.get(userId)?.set(network, new ethers.Wallet(privateKey, provider));
         }
+
+        // Initial balance update
+        this.updateWalletBalances(userId, network);
     }
 
     getUserWallet(userId: number, network: 'ETH' | 'BSC' | 'SOL'): any {
@@ -119,13 +184,23 @@ export class SniperBot {
     // Add removeUserWallet method
     removeUserWallet(userId: number, network: 'ETH' | 'BSC' | 'SOL') {
         this.userWallets.get(userId)?.delete(network);
+
+        // If no wallets left, stop balance updates
+        if (!this.hasUserWallet(userId, 'ETH') && !this.hasUserWallet(userId, 'BSC') && !this.hasUserWallet(userId, 'SOL')) {
+            const interval = this.balanceUpdateIntervals.get(userId);
+            if (interval) {
+                clearInterval(interval);
+                this.balanceUpdateIntervals.delete(userId);
+            }
+            this.lastBalanceMessages.delete(userId);
+        }
     }
 
     // --- UTILS ---
     private detectNetworkFromAddress(tokenAddress: string): 'ETH' | 'BSC' | 'SOL' | null {
         // These are simple heuristic checks, a real implementation might use more robust methods.
-        if (tokenAddress.startsWith('0x') && tokenAddress.length === 42) return 'ETH'; 
-        if (tokenAddress.length === 44) return 'SOL'; 
+        if (tokenAddress.startsWith('0x') && tokenAddress.length === 42) return 'ETH';
+        if (tokenAddress.length === 44) return 'SOL';
         return null; // Could also return 'BSC' if specific BSC address patterns are known
     }
 
@@ -140,7 +215,7 @@ export class SniperBot {
             if (network === 'SOL') {
                 const connection = wallet.provider;
                 balance = await connection.getBalance(wallet.keypair.publicKey);
-                return `${(balance / 10**9).toFixed(4)} SOL`; // Convert lamports to SOL
+                return `${(balance / 10 ** 9).toFixed(4)} SOL`; // Convert lamports to SOL
             } else {
                 const provider = wallet.provider;
                 if (!provider) return `No provider for ${network}.`;
@@ -154,8 +229,6 @@ export class SniperBot {
 
     // --- SNIPE FUNCTIONS ---
     private async snipeEvmToken(userId: number, network: 'ETH' | 'BSC', tokenAddress: string, amount: number, slippage: number): Promise<TransactionResponse> {
-        if (network !== 'ETH' && network !== 'BSC') throw new Error('snipeEvmToken only supports ETH or BSC');
-        
         const wallet = this.getUserWallet(userId, network);
         if (!wallet) {
             throw new Error(`No wallet configured for ${network} for this user.`);
@@ -183,7 +256,6 @@ export class SniperBot {
         );
 
         await tx.wait();
-        this.botConfig.onLog(`✅ Sniped ${tokenAddress} on ${network}: ${networkConfig.explorer}${tx.hash}`, userId);
         return tx;
     }
 
@@ -193,47 +265,75 @@ export class SniperBot {
             this.botConfig.onLog('Sniper Bot is already running in background for this user.', userId);
             return;
         }
+
+        // Get user's configuration
+        const config = this.userConfigs.get(userId) || this.botConfig;
+
+        // Check wallet balances
+        let hasEnoughFunds = false;
+        for (const network of ['ETH', 'BSC', 'SOL'] as const) {
+            if (this.hasUserWallet(userId, network)) {
+                const balanceStr = await this.getWalletBalance(userId, network);
+                const balance = parseFloat(balanceStr.split(' ')[0]);
+                if (balance >= config.amount) {
+                    hasEnoughFunds = true;
+                    break;
+                }
+            }
+        }
+
+        if (!hasEnoughFunds) {
+            this.botConfig.onLog('🛑 Sniper Bot cannot start: Insufficient funds in all wallets.', userId);
+            return;
+        }
+
         this.isRunning = true;
         this.stopFlag = false;
         this.botConfig.onLog('🚀 Sniper Bot started in background. Searching for tokens...', userId);
 
+        // Show initial wallet balances
+        const ethBalance = await this.getWalletBalance(userId, 'ETH');
+        const bscBalance = await this.getWalletBalance(userId, 'BSC');
+        const solBalance = await this.getWalletBalance(userId, 'SOL');
+        this.botConfig.onLog(`💰 Initial Balances:\n🔷 ETH: ${ethBalance}\n🟡 BSC: ${bscBalance}\n🟣 SOL: ${solBalance}`, userId);
+
+        // Start token scanner
+        await tokenScanner.startScanning();
+
         const interval = setInterval(async () => {
             try {
-                // Log wallet balances periodically
-                const ethBalance = await this.getWalletBalance(userId, 'ETH');
-                const bscBalance = await this.getWalletBalance(userId, 'BSC');
-                const solBalance = await this.getWalletBalance(userId, 'SOL');
-                this.botConfig.onLog(`💰 Current Balances:\n🔷 ETH: ${ethBalance}\n🟡 BSC: ${bscBalance}\n🟣 SOL: ${solBalance}`, userId);
-
-                // Check for new tokens (replace with real API or AI model)
-                const tokens = await this.fetchPotentialTokens();
+                // Check for new tokens
+                const tokens = tokenScanner.getTokenList();
                 if (tokens.length > 0) {
                     this.botConfig.onLog(`🔍 Found ${tokens.length} potential tokens.`, userId);
                 }
+
                 for (const token of tokens) {
-                    const network = this.detectNetworkFromAddress(token);
-                    if (network && (network === 'ETH' || network === 'BSC')) {
-                        const wallet = this.getUserWallet(userId, network);
-                        if (wallet) {
-                            try {
-                                this.botConfig.onLog(`Attempting to snipe ${token} on ${network}...`, userId);
-                                await this.snipeEvmToken(userId, network, token, this.botConfig.amount, this.botConfig.slippage);
-                                this.botConfig.onLog(`🎯 Successfully sniped ${token} on ${network}.`, userId);
-                                // Add logic to check updated balance here later
-                            } catch (error) {
-                                this.botConfig.onLog(`❌ Failed to snipe ${token} on ${network}: ${(error as Error).message}`, userId);
-                                this.botConfig.onError(error as Error, userId);
+                    if (this.hasUserWallet(userId, token.network)) {
+                        try {
+                            // Validate token before attempting to buy
+                            if (await this.validateToken(token.mint, token.network)) {
+                                this.botConfig.onLog(`Attempting to snipe ${token.name} (${token.mint}) on ${token.network}...`, userId);
+                                if (token.network === 'SOL') {
+                                    const wallet = this.getUserWallet(userId, token.network);
+                                    await this.executeSolSnipe(wallet, token.mint, config.amount, config.slippage);
+                                } else {
+                                    await this.snipeEvmToken(userId, token.network, token.mint, config.amount, config.slippage);
+                                }
+                                this.botConfig.onLog(`🎯 Successfully sniped ${token.name} on ${token.network}.`, userId);
+                            } else {
+                                this.botConfig.onLog(`⚠️ Token ${token.mint} on ${token.network} failed validation.`, userId);
                             }
-                        } else {
-                            this.botConfig.onLog(`⚠️ No ${network} wallet configured for auto-snipe.`, userId);
+                        } catch (error) {
+                            this.botConfig.onLog(`❌ Failed to snipe ${token.mint} on ${token.network}: ${(error as Error).message}`, userId);
+                            this.botConfig.onError(error as Error, userId);
                         }
                     }
                 }
             } catch (error) {
-                console.error('Monitoring error:', error);
                 this.botConfig.onError(error as Error, userId);
             }
-        }, 15000); // Check every 15 seconds
+        }, 15000);
 
         this.monitoringIntervals.set(userId, interval);
     }
@@ -243,17 +343,59 @@ export class SniperBot {
         if (interval) {
             clearInterval(interval);
             this.monitoringIntervals.delete(userId);
+            tokenScanner.stopScanning();
             this.botConfig.onLog('🛑 Sniper Bot stopped for this user.', userId);
+        }
+
+        // Clear balance update interval
+        const balanceInterval = this.balanceUpdateIntervals.get(userId);
+        if (balanceInterval) {
+            clearInterval(balanceInterval);
+            this.balanceUpdateIntervals.delete(userId);
+        }
+        this.lastBalanceMessages.delete(userId);
+    }
+
+    // --- SWAP FUNCTIONS ---
+    private async executeSolSnipe(wallet: any, tokenAddress: string, amount: number, slippage: number): Promise<string> {
+        try {
+            const raydiumSwap = new RaydiumSwap(NETWORK_CONFIGS.SOL.rpc, wallet.privateKey);
+            await raydiumSwap.loadPoolKeys();
+
+            // Find pool info
+            const poolKeys = await raydiumSwap.findRaydiumPoolInfo(WSOL_ADDRESS, tokenAddress);
+            if (!poolKeys) {
+                throw new Error('Pool not found for token');
+            }
+
+            // Get swap transaction
+            const swapTx = await raydiumSwap.getSwapTransaction(
+                tokenAddress,
+                amount,
+                poolKeys,
+                true, // use versioned transaction
+                slippage
+            );
+
+            // Send transaction
+            if (swapTx instanceof VersionedTransaction) {
+                const { blockhash, lastValidBlockHeight } = await raydiumSwap.connection.getLatestBlockhash();
+                return await raydiumSwap.sendVersionedTransaction(swapTx, blockhash, lastValidBlockHeight);
+            } else {
+                return await raydiumSwap.sendLegacyTransaction(swapTx as Transaction);
+            }
+        } catch (error) {
+            throw error;
         }
     }
 
     // --- DUMMY AI & API MOCK ---
-    private async fetchPotentialTokens(): Promise<string[]> {
-      // Replace with real API or AI model
-      return [
-        // '0x123FakeEthToken...',
-        // '0x456FakeBscToken...'
-      ];
+    private async fetchPotentialTokens(userId: number): Promise<string[]> {
+        // Replace with real API or AI model
+        return [
+            // '0x123FakeEthToken...',
+            // '0x456FakeBscToken...'
+        ];
     }
 
     private async getTokenPrice(tokenAddress: string, network: 'ETH' | 'BSC'): Promise<bigint> {
@@ -284,8 +426,8 @@ export class SniperBot {
             const tx = await (router.connect(wallet) as ethers.Contract & { swapExactTokensForETH: Function }).swapExactTokensForETH(
                 position.amount,
                 0, // Accept any amount of ETH
-                    path,
-                    wallet.address,
+                path,
+                wallet.address,
                 Math.floor(Date.now() / 1000) + 60 * 20
             );
             await tx.wait();
@@ -313,7 +455,6 @@ export class SniperBot {
                         tokenContract.name(),
                         tokenContract.symbol()
                     ]);
-                    this.botConfig.onLog(`Token Info (ETH):\nName: ${name}\nSymbol: ${symbol}`, 0);
                     return 'ETH';
                 } catch (e) {
                     // If name/symbol calls fail, it might still be an ETH contract
@@ -338,7 +479,6 @@ export class SniperBot {
                         tokenContract.name(),
                         tokenContract.symbol()
                     ]);
-                    this.botConfig.onLog(`Token Info (BSC):\nName: ${name}\nSymbol: ${symbol}`, 0);
                     return 'BSC';
                 } catch (e) {
                     // If name/symbol calls fail, it might still be a BSC contract
@@ -352,19 +492,27 @@ export class SniperBot {
             const connection = new Connection(NETWORK_CONFIGS.SOL.rpc);
             const account = await connection.getAccountInfo(new PublicKey(tokenAddress));
             if (account) {
-                // For SOL, we can check if it's an SPL token
-                try {
-                    const tokenInfo = await connection.getTokenSupply(new PublicKey(tokenAddress));
-                    this.botConfig.onLog(`Token Info (SOL):\nSupply: ${tokenInfo.value.amount}`, 0);
-                    return 'SOL';
-                } catch (e) {
-                    // If token supply check fails, it might still be a SOL address
-                    return 'SOL';
-                }
+                return 'SOL';
             }
         } catch (e) { /* console.error('SOL network detection error:', e); */ }
 
         return null;
+    }
+
+    private async validateToken(tokenAddress: string, network: 'ETH' | 'BSC' | 'SOL'): Promise<boolean> {
+        try {
+            if (network === 'SOL') {
+                const connection = new Connection(NETWORK_CONFIGS.SOL.rpc);
+                const account = await connection.getAccountInfo(new PublicKey(tokenAddress));
+                return account !== null;
+            } else {
+                const provider = new ethers.JsonRpcProvider(NETWORK_CONFIGS[network].rpc);
+                const code = await provider.getCode(tokenAddress);
+                return code !== '0x';
+            }
+        } catch (error) {
+            return false;
+        }
     }
 
     async buyTokenFromUserInput(userId: number, tokenAddress: string) {
@@ -372,6 +520,81 @@ export class SniperBot {
         if (!network) {
             throw new Error('Could not detect token network for the given address.');
         }
+
+        // Get token info before proceeding
+        let tokenName = 'Unknown';
+        try {
+            if (network === 'SOL') {
+                const connection = new Connection(NETWORK_CONFIGS.SOL.rpc);
+                const metadata = await connection.getAccountInfo(new PublicKey(tokenAddress));
+                
+                // Get token metadata from Metaplex
+                try {
+                    const metadataPDA = await PublicKey.findProgramAddressSync(
+                        [
+                            Buffer.from('metadata'),
+                            new PublicKey('metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s').toBuffer(),
+                            new PublicKey(tokenAddress).toBuffer(),
+                        ],
+                        new PublicKey('metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s')
+                    );
+                    
+                    const metadataAccount = await connection.getAccountInfo(metadataPDA[0]);
+                    if (metadataAccount) {
+                        try {
+                            const metadata = deserializeMetadata(metadataAccount as any);
+                            tokenName = metadata.name || 'Unknown';
+                        } catch (e) {
+                            // If deserialization fails, try to get basic token info
+                            const tokenInfo = await connection.getParsedAccountInfo(new PublicKey(tokenAddress));
+                            if (tokenInfo.value && 'data' in tokenInfo.value && 'parsed' in tokenInfo.value.data) {
+                                const parsedData = tokenInfo.value.data as ParsedAccountData;
+                                if (parsedData.parsed && parsedData.parsed.info && parsedData.parsed.info.name) {
+                                    tokenName = parsedData.parsed.info.name;
+                                }
+                            }
+                        }
+                    }
+                } catch (e) {
+                    // If metadata fetch fails, try to get basic token info
+                    const tokenInfo = await connection.getParsedAccountInfo(new PublicKey(tokenAddress));
+                    if (tokenInfo.value && 'data' in tokenInfo.value && 'parsed' in tokenInfo.value.data) {
+                        const parsedData = tokenInfo.value.data as ParsedAccountData;
+                        if (parsedData.parsed && parsedData.parsed.info && parsedData.parsed.info.name) {
+                            tokenName = parsedData.parsed.info.name;
+                        }
+                    }
+                }
+            } else {
+                const provider = new ethers.JsonRpcProvider(NETWORK_CONFIGS[network].rpc);
+                const tokenContract = new ethers.Contract(
+                    tokenAddress,
+                    [
+                        'function name() view returns (string)',
+                        'function symbol() view returns (string)'
+                    ],
+                    provider
+                );
+                
+                const [name, symbol] = await Promise.all([
+                    tokenContract.name(),
+                    tokenContract.symbol()
+                ]);
+                
+                tokenName = `${name} (${symbol})`;
+            }
+        } catch (error) {
+            this.botConfig.onLog(`Warning: Could not fetch complete token info: ${(error as Error).message}`, userId);
+        }
+
+        // Log token info before proceeding
+        this.botConfig.onLog(
+            `🔍 Token Information:\n` +
+            `Network: ${network}\n` +
+            `Name: ${tokenName}\n` +
+            `Address: ${tokenAddress}`,
+            userId
+        );
 
         const wallet = this.getUserWallet(userId, network);
         if (!wallet) {
@@ -388,7 +611,7 @@ export class SniperBot {
         } else if (network === 'SOL') {
             const connection = new Connection(NETWORK_CONFIGS.SOL.rpc);
             const balance = await connection.getBalance(new PublicKey(wallet.address));
-            if (balance && balance >= parseFloat(ethers.parseEther(this.botConfig.amount.toString()).toString())) { // Convert BigInt to number for SOL lamports
+            if (balance && balance >= parseFloat(ethers.parseEther(this.botConfig.amount.toString()).toString())) {
                 hasEnoughFunds = true;
             }
         }
@@ -401,7 +624,7 @@ export class SniperBot {
             let txResult: TransactionResponse | string;
 
             if (network === 'SOL') {
-                txResult = await this.executeSolSnipe(wallet, 0, tokenAddress, this.botConfig.amount);
+                txResult = await this.executeSolSnipe(wallet, tokenAddress, this.botConfig.amount, this.botConfig.slippage);
             } else if (network === 'ETH' || network === 'BSC') {
                 txResult = await this.snipeEvmToken(userId, network, tokenAddress, this.botConfig.amount, this.botConfig.slippage);
             } else {
@@ -428,38 +651,10 @@ export class SniperBot {
                 explorerLink = `${NETWORK_CONFIGS[network].explorer}${(txResult as TransactionResponse).hash}`;
             }
 
-            this.botConfig.onLog(`Bought ${tokenAddress} for wallet ${wallet.address}: ${explorerLink}`, userId);
+            this.botConfig.onLog(`✅ Successfully bought ${tokenName} (${tokenAddress}): ${explorerLink}`, userId);
         } catch (error) {
             this.botConfig.onError(error as Error, userId);
             throw error; // Re-throw to be caught by Telegram handler
         }
-    }
-
-    private async executeSolSnipe(wallet: ethers.Wallet, index: number, tokenAddress: string, amount: number): Promise<string> {
-        const connection = new Connection(NETWORK_CONFIGS.SOL.rpc);
-        let walletKeypair: Keypair;
-        try {
-            const rawPrivateKey = wallet.privateKey.startsWith('0x') ? wallet.privateKey.slice(2) : wallet.privateKey;
-            walletKeypair = Keypair.fromSecretKey(Buffer.from(rawPrivateKey, 'hex'));
-        } catch (e) {
-            console.error("Error converting private key for Solana. Ensure wallet.privateKey is raw hex.", e);
-            throw new Error('Invalid Solana private key provided.');
-        }
-
-        const transaction = new Transaction().add(
-            SystemProgram.transfer({ 
-                fromPubkey: walletKeypair.publicKey,
-                toPubkey: new PublicKey(tokenAddress), 
-                lamports: BigInt(ethers.parseEther(amount.toString()).toString()) 
-            })
-        );
-
-        const { blockhash } = await connection.getLatestBlockhash();
-        transaction.recentBlockhash = blockhash;
-        transaction.feePayer = walletKeypair.publicKey;
-
-        const signature = await connection.sendTransaction(transaction, [walletKeypair]);
-        await connection.confirmTransaction(signature);
-        return signature;
     }
 }

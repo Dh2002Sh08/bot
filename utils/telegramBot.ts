@@ -4,10 +4,10 @@ import dotenv from 'dotenv';
 import { ethers } from 'ethers';
 import { Connection, PublicKey, Keypair } from '@solana/web3.js';
 
-import { SniperBot, NETWORK_CONFIGS, UNISWAP_ROUTER_ABI, PANCAKESWAP_ROUTER_ABI } from '../lib/sniperBot';
+import { SniperBot, NETWORK_CONFIGS } from '../lib/sniperBot';
 import { volumeBot } from '../lib/volumeBot';
 import { BSCWalletManager } from './walletManager';
-import { walletStorage } from './walletStorage';
+// import { walletStorage } from './walletStorage';
 
 dotenv.config();
 
@@ -40,11 +40,17 @@ const sniperBot = new SniperBot({
     slippage: 10, // Default slippage
     stopLoss: 20, // Default stop loss
     takeProfit: 200, // Default take profit
-    onLog: async (msg: string, userId: number) => {
+    onLog: async (msg: string, userId: number, messageId?: number, deleteMessage?: boolean) => {
         try {
-            await bot.telegram.sendMessage(userId, `📝 ${msg}`);
+            if (deleteMessage && messageId) {
+                await bot.telegram.deleteMessage(userId, messageId);
+                return 0;
+            }
+            const message = await bot.telegram.sendMessage(userId, `📝 ${msg}`);
+            return message.message_id;
         } catch (error) {
             console.error(`Error sending log message to user ${userId}:`, error);
+            return 0;
         }
     },
     onError: async (error: Error, userId: number) => {
@@ -70,22 +76,22 @@ const mainKeyboard = Markup.keyboard([
     ['/loadwallet']
 ]).resize();
 
-// Modify the wallet network keyboard to include toggle buttons
+// Modify the wallet network keyboard to include activate/deactivate buttons
 const walletNetworkKeyboard = Markup.keyboard([
     [
         Markup.button.text('🔷 ETH Wallet'),
         Markup.button.text('👛 Create ETH Wallet'),
-        Markup.button.text('🔷 Toggle ETH')
+        Markup.button.text('🔷 Activate ETH')
     ],
     [
         Markup.button.text('🟡 BSC Wallet'),
         Markup.button.text('👛 Create BSC Wallet'),
-        Markup.button.text('🟡 Toggle BSC')
+        Markup.button.text('🟡 Activate BSC')
     ],
     [
         Markup.button.text('🟣 SOL Wallet'),
         Markup.button.text('👛 Create SOL Wallet'),
-        Markup.button.text('🟣 Toggle SOL')
+        Markup.button.text('🟣 Activate SOL')
     ],
     ['🔙 Back to Main']
 ]).resize();
@@ -104,9 +110,9 @@ const startSuggestionsKeyboard = Markup.inlineKeyboard([
 
 // Add wallet management keyboard
 const walletManagementKeyboard = Markup.keyboard([
-    [Markup.button.text('🔷 ETH Wallet'), Markup.button.text('🔷 Toggle ETH')],
-    [Markup.button.text('🟡 BSC Wallet'), Markup.button.text('🟡 Toggle BSC')],
-    [Markup.button.text('🟣 SOL Wallet'), Markup.button.text('🟣 Toggle SOL')],
+    [Markup.button.text('🔷 ETH Wallet'), Markup.button.text('🔷 Deactivate ETH')],
+    [Markup.button.text('🟡 BSC Wallet'), Markup.button.text('🟡 Deactivate BSC')],
+    [Markup.button.text('🟣 SOL Wallet'), Markup.button.text('🟣 Deactivate SOL')],
     ['🔙 Back to Main']
 ]).resize();
 
@@ -116,27 +122,42 @@ bot.command('start', async (ctx) => {
     if (!userId) return;
 
     // Load existing wallets
-    const storedWallets = walletStorage.loadWallets(userId);
-    if (storedWallets) {
-        // Initialize wallets in SniperBot
-        for (const [network, walletData] of Object.entries(storedWallets)) {
-            if (walletData.isActive) {
-                sniperBot.setUserWallet(userId, network as 'ETH' | 'BSC' | 'SOL', walletData.privateKey);
-            }
-        }
+    // const storedWallets = walletStorage.loadWallets(userId);
+    // if (storedWallets) {
+    //     // Initialize wallets in SniperBot
+    //     // for (const [network, walletData] of Object.entries(storedWallets)) {
+    //     //     if (walletData.isActive) {
+    //     //         sniperBot.setUserWallet(userId, network as 'ETH' | 'BSC' | 'SOL', walletData.privateKey);
+    //     //     }
+    //     // }
 
-        // Show wallet balances
-        let balanceMessage = '📊 Your Wallets:\n\n';
-        for (const network of ['ETH', 'BSC', 'SOL'] as const) {
-            const wallet = sniperBot.getUserWallet(userId, network);
-            if (wallet) {
-                const balance = await sniperBot.getWalletBalance(userId, network);
-                balanceMessage += `${network === 'ETH' ? '🔷' : network === 'BSC' ? '🟡' : '🟣'} ${network}:\n`;
-                balanceMessage += `Address: \`${wallet.address}\`\n`;
-                balanceMessage += `Balance: ${balance}\n\n`;
-            }
-        }
-        await ctx.reply(balanceMessage, { parse_mode: 'Markdown' });
+    //     // Show wallet balances
+    //     let balanceMessage = '📊 Your Wallets:\n\n';
+    //     for (const network of ['ETH', 'BSC', 'SOL'] as const) {
+    //         const wallet = sniperBot.getUserWallet(userId, network);
+    //         if (wallet) {
+    //             const balance = await sniperBot.getWalletBalance(userId, network);
+    //             balanceMessage += `${network === 'ETH' ? '🔷' : network === 'BSC' ? '🟡' : '🟣'} ${network}:\n`;
+    //             balanceMessage += `Address: \`${wallet.address}\`\n`;
+    //             balanceMessage += `Balance: ${balance}\n\n`;
+    //         }
+    //     }
+    //     await ctx.reply(balanceMessage, { parse_mode: 'Markdown' });
+    // }
+
+    // Show configuration status
+    const userConfig = sniperBot.getUserConfig(userId);
+    if (userConfig) {
+        await ctx.reply(
+            '📊 Current Configuration:\n\n' +
+            `Amount: ${userConfig.amount} ETH/BNB/SOL\n` +
+            `Slippage: ${userConfig.slippage}%\n` +
+            `Stop Loss: ${userConfig.stopLoss}%\n` +
+            `Take Profit: ${userConfig.takeProfit}%`
+        );
+    } else {
+        await ctx.reply('⚠️ No configuration set. Please set your configuration first.');
+        await ctx.scene.enter('config');
     }
 
     await ctx.reply('Welcome to the Sniper Bot! 🚀 Please choose an option:', startSuggestionsKeyboard);
@@ -193,8 +214,8 @@ bot.hears('👛 Create Wallet', async (ctx) => {
 
 // Modify the wallet creation handler
 bot.hears(['👛 Create ETH Wallet', '👛 Create BSC Wallet', '👛 Create SOL Wallet'], async (ctx) => {
-        const userId = ctx.from?.id;
-        if (!userId) return;
+    const userId = ctx.from?.id;
+    if (!userId) return;
 
     const networkText = ctx.message.text;
     const network: 'ETH' | 'BSC' | 'SOL' = networkText.includes('ETH') ? 'ETH' :
@@ -226,17 +247,15 @@ bot.hears(['👛 Create ETH Wallet', '👛 Create BSC Wallet', '👛 Create SOL 
             isActive: true,
             privateKey: wallet.privateKey
         });
-
-        // Save to persistent storage
-        const storedWallets = walletStorage.loadWallets(userId) || {};
-        storedWallets[network] = {
-            isActive: true,
-            privateKey: wallet.privateKey
-        };
-        walletStorage.saveWallets(userId, storedWallets);
         
         // Set wallet in SniperBot
         sniperBot.setUserWallet(userId, network, wallet.privateKey);
+
+        // Create keyboard with balance check button
+        const keyboard = Markup.keyboard([
+            [Markup.button.text(`💰 Check ${network} Balance`)],
+            ['🔙 Back to Main']
+        ]).resize();
 
         const replyMessage = await ctx.reply(
             `✅ ${network} Wallet Created!\n\n` +
@@ -245,7 +264,7 @@ bot.hears(['👛 Create ETH Wallet', '👛 Create BSC Wallet', '👛 Create SOL 
             '⚠️ **IMPORTANT:** Save these details securely! This message will be deleted automatically in 2 minutes.',
             {
                 parse_mode: 'Markdown',
-                ...walletNetworkKeyboard
+                ...keyboard
             }
         );
 
@@ -263,36 +282,43 @@ bot.hears(['👛 Create ETH Wallet', '👛 Create BSC Wallet', '👛 Create SOL 
     }
 });
 
-// Add wallet toggle handlers
-bot.hears(['🔷 Toggle ETH', '🟡 Toggle BSC', '🟣 Toggle SOL'], async (ctx) => {
-        const userId = ctx.from?.id;
-        if (!userId) return;
+// Update wallet activation/deactivation handlers
+bot.hears(['🔷 Activate ETH', '🟡 Activate BSC', '🟣 Activate SOL', '🔷 Deactivate ETH', '🟡 Deactivate BSC', '🟣 Deactivate SOL'], async (ctx) => {
+    const userId = ctx.from?.id;
+    if (!userId) return;
 
     const networkText = ctx.message.text;
     const network: 'ETH' | 'BSC' | 'SOL' = networkText.includes('ETH') ? 'ETH' :
                                           networkText.includes('BSC') ? 'BSC' :
                                           'SOL';
+    const isActivate = networkText.includes('Activate');
 
     const userWalletMap = userWallets.get(userId);
     if (!userWalletMap || !userWalletMap.has(network)) {
         await ctx.reply(`❌ No ${network} wallet found. Please create one first.`, walletNetworkKeyboard);
-            return;
-        }
+        return;
+    }
 
     const walletState = userWalletMap.get(network)!;
-    walletState.isActive = !walletState.isActive;
+    
+    // Only allow activation if wallet is inactive, and deactivation if wallet is active
+    if (isActivate && walletState.isActive) {
+        await ctx.reply(`ℹ️ ${network} wallet is already active.`, walletManagementKeyboard);
+        return;
+    }
+    if (!isActivate && !walletState.isActive) {
+        await ctx.reply(`ℹ️ ${network} wallet is already inactive.`, walletNetworkKeyboard);
+        return;
+    }
 
-    // Save to persistent storage
-    const storedWallets = walletStorage.loadWallets(userId) || {};
-    storedWallets[network] = walletState;
-    walletStorage.saveWallets(userId, storedWallets);
+    walletState.isActive = isActivate;
 
-    if (walletState.isActive) {
+    if (isActivate) {
         sniperBot.setUserWallet(userId, network, walletState.privateKey);
         await ctx.reply(`✅ ${network} wallet activated!`, walletManagementKeyboard);
     } else {
         sniperBot.removeUserWallet(userId, network);
-        await ctx.reply(`🛑 ${network} wallet deactivated!`, walletManagementKeyboard);
+        await ctx.reply(`🛑 ${network} wallet deactivated!`, walletNetworkKeyboard);
     }
 });
 
@@ -476,9 +502,128 @@ const loadWalletScene = new Scenes.WizardScene<MyContext>(
     }
 );
 
+// Add configuration scene
+const configScene = new Scenes.WizardScene<MyContext>(
+    'config',
+    async (ctx) => {
+        await ctx.reply(
+            'Please configure your Sniper Bot settings:\n\n' +
+            '1. Amount to trade (in ETH/BNB/SOL)\n' +
+            '2. Slippage (%)\n' +
+            '3. Stop Loss (%)\n' +
+            '4. Take Profit (%)\n\n' +
+            'Reply with values separated by spaces (e.g., "0.1 5 10 20")',
+            backToMainKeyboard
+        );
+        return ctx.wizard.next();
+    },
+    async (ctx) => {
+        const userId = ctx.from?.id;
+        if (!userId) return ctx.scene.leave();
+
+        if (!ctx.message || !('text' in ctx.message)) {
+            await ctx.reply('❌ Invalid input. Please provide numbers separated by spaces.');
+            return ctx.wizard.back();
+        }
+
+        const [amount, slippage, stopLoss, takeProfit] = ctx.message.text.split(' ').map(Number);
+        
+        if (isNaN(amount) || isNaN(slippage) || isNaN(stopLoss) || isNaN(takeProfit)) {
+            await ctx.reply('❌ Invalid numbers. Please provide valid numbers separated by spaces.');
+            return ctx.wizard.back();
+        }
+
+        // Update user's configuration
+        sniperBot.updateUserConfig(userId, {
+            amount,
+            slippage,
+            stopLoss,
+            takeProfit,
+            onError: sniperBot.getErrorCallback(),
+            onLog: sniperBot.getLogCallback()
+        });
+
+        await ctx.reply(
+            '✅ Configuration saved!\n\n' +
+            `Amount: ${amount} ETH/BNB/SOL\n` +
+            `Slippage: ${slippage}%\n` +
+            `Stop Loss: ${stopLoss}%\n` +
+            `Take Profit: ${takeProfit}%`,
+            mainKeyboard
+        );
+
+        return ctx.scene.leave();
+    }
+);
+
+// Register the config scene
+stage.register(configScene);
+
 stage.register(tokenInputScene, loadWalletScene);
 
 // Command to enter the load wallet wizard
 bot.command('loadwallet', (ctx) => ctx.scene.enter('loadWallet'));
+
+// Add configuration command
+bot.command('config', (ctx) => ctx.scene.enter('config'));
+
+// Add command suggestions
+bot.telegram.setMyCommands([
+    { command: 'start', description: 'Start the bot' },
+    { command: 'loadwallet', description: 'Load existing wallet' },
+    { command: 'config', description: 'Configure bot settings' },
+    { command: 'balance', description: 'Check wallet balances' },
+    { command: 'stop', description: 'Stop the bot' }
+]);
+
+// Add balance check handler
+bot.hears(/💰 Check (ETH|BSC|SOL) Balance/, async (ctx) => {
+    const userId = ctx.from?.id;
+    if (!userId) return;
+
+    const networkText = ctx.match[1];
+    const network = networkText as 'ETH' | 'BSC' | 'SOL';
+
+    try {
+        const balance = await sniperBot.getWalletBalance(userId, network);
+        const emoji = network === 'ETH' ? '🔷' : network === 'BSC' ? '🟡' : '🟣';
+        
+        // Create keyboard with balance check button
+        const keyboard = Markup.keyboard([
+            [Markup.button.text(`💰 Check ${network} Balance`)],
+            ['🔙 Back to Main']
+        ]).resize();
+
+        await ctx.reply(`${emoji} ${network} Balance: ${balance}`, keyboard);
+    } catch (error) {
+        await ctx.reply(`❌ Failed to get balance: ${(error as Error).message}`);
+    }
+});
+
+// Add balance command
+bot.command('balance', async (ctx) => {
+    const userId = ctx.from?.id;
+    if (!userId) return;
+
+    try {
+        const balances = [];
+        for (const network of ['ETH', 'BSC', 'SOL'] as const) {
+            if (sniperBot.hasUserWallet(userId, network)) {
+                const balance = await sniperBot.getWalletBalance(userId, network);
+                const emoji = network === 'ETH' ? '🔷' : network === 'BSC' ? '🟡' : '🟣';
+                balances.push(`${emoji} ${network}: ${balance}`);
+            }
+        }
+
+        if (balances.length > 0) {
+            const message = `💰 Wallet Balances:\n${balances.join('\n')}`;
+            await ctx.reply(message);
+        } else {
+            await ctx.reply('❌ No wallets found. Please create a wallet first.');
+        }
+    } catch (error) {
+        await ctx.reply(`❌ Failed to get balances: ${(error as Error).message}`);
+    }
+});
 
 export default bot;

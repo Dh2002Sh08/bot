@@ -12,8 +12,10 @@
   "dependencies": {
     "@jup-ag/api": "^6.0.42",
     "@solana/web3.js": "^1.87.6",
+    "@types/express": "^5.0.3",
     "dotenv": "^16.3.1",
     "ethers": "^6.7.1",
+    "express": "^5.1.0",
     "node-telegram-bot-api": "^0.66.0",
     "react": "^19.1.0",
     "telegraf": "^4.15.3"

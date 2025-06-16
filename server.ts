@@ -1,9 +1,17 @@
 import bot from './utils/telegramBot';
 import { session } from 'telegraf';
+import express, { Request, Response } from 'express';
+
+const app = express();
 
 // Error handling
 process.on('uncaughtException', (error) => {
     console.error('Uncaught Exception:', error);
+});
+
+// Health check endpoint
+app.get('/', (req: Request, res: Response) => {
+    res.send('Bot is alive!');
 });
 
 // Handle bot launch with retries
@@ -55,5 +63,10 @@ const startBot = async (retryCount = 0) => {
     }
 };
 
-// Start the bot
-startBot(); 
+// Start both the bot and Express server
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+    console.log(`Health check server running on port ${PORT}`);
+    // Start the bot after the server is running
+    startBot();
+}); 

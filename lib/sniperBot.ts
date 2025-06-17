@@ -10,6 +10,7 @@ import dotenv from 'dotenv';
 import { UNISWAP_ROUTER_ABI } from '../Address/uniswapRouterABI';
 import { PANCAKESWAP_ROUTER_ABI } from '../Address/pancakeswapRouterABI';
 import { tokenScanner } from './tokenScanner';
+import { EnhancedTokenScanner, TokenData, TokenValidationCriteria } from './enhancedTokenScanner';
 // Removed Telegraf, Markup, Scenes, session, message imports
 import { RaydiumSwap } from './raydiumSwap';
 import { VersionedTransaction } from '@solana/web3.js';
@@ -59,6 +60,10 @@ interface TokenPosition {
     stopLoss: number;
     takeProfit: number;
     network: 'ETH' | 'BSC' | 'SOL';
+    tokenSymbol: string;
+    tokenName: string;
+    entryTime: number;
+    currentPrice: number;
 }
 
 interface JupiterPriceResponse {
@@ -86,9 +91,190 @@ export class SniperBot {
     private userConfigs: Map<number, SniperBotConfig> = new Map(); // Store user-specific configs
     private balanceUpdateIntervals: Map<number, NodeJS.Timeout> = new Map();
     private lastBalanceMessages: Map<number, number> = new Map();
+    private enhancedTokenScanner: EnhancedTokenScanner | null = null;
+    private userValidationCriteria: Map<number, TokenValidationCriteria> = new Map();
+    private snipedTokens: Map<number, TokenData[]> = new Map(); // Track sniped tokens per user
+    private positionMonitoringIntervals: Map<number, NodeJS.Timeout> = new Map();
+    private lastPriceLogs: Map<string, number> = new Map(); // Re-trigger linter
 
     constructor(config: SniperBotConfig) {
         this.botConfig = config;
+    }
+
+    // Initialize enhanced token scanner
+    async initializeEnhancedTokenScanner() {
+        try {
+            // Default validation criteria
+            const defaultCriteria: TokenValidationCriteria = {
+                minLiquidity: 1000,
+                minVolume: 25,
+                requireDexScreener: true
+            };
+
+            this.enhancedTokenScanner = new EnhancedTokenScanner(
+                defaultCriteria,
+                this.handleTokenDetected.bind(this),
+                this.handleTokenScannerError.bind(this)
+            );
+
+            await this.enhancedTokenScanner.initialize();
+            console.log('✅ Enhanced Token Scanner initialized in SniperBot');
+        } catch (error) {
+            console.error('❌ Failed to initialize Enhanced Token Scanner:', error);
+        }
+    }
+
+    // Handle token detection from enhanced scanner
+    private async handleTokenDetected(tokenData: TokenData) {
+        try {
+            // Send token detection message to ALL users who have configurations
+            for (const [userId, userConfig] of this.userConfigs) {
+                await this.botConfig.onLog(
+                    `🔎 Token detected! Checking for snipe...\n\n` +
+                    `🪙 ${tokenData.symbol} (${tokenData.name})\n` +
+                    `🌐 Network: ${tokenData.network}\n` +
+                    `💰 Price: $${tokenData.price.toFixed(8)}\n` +
+                    `💧 Liquidity: $${tokenData.liquidity.toLocaleString()}\n` +
+                    `📊 24h Volume: $${tokenData.volume24h.toLocaleString()}\n` +
+                    `⏰ Age: ${tokenData.age}\n` +
+                    `📍 Address: \`${tokenData.address}\`\n` +
+                    `🔗 [DexScreener](${tokenData.dexScreenerUrl})`,
+                    userId
+                );
+
+                // Perform validation here using the scanner's criteria (or user's if set)
+                const userCriteria = this.userValidationCriteria.get(userId) || tokenData.scannerCriteria; // Use scanner's criteria as fallback
+                
+                let validationMessage = '✅ Token passed all criteria!';
+                let isValid = true;
+
+                if (tokenData.liquidity < userCriteria.minLiquidity) {
+                    isValid = false;
+                    validationMessage = `❌ Failed: Liquidity ($${tokenData.liquidity.toLocaleString()}) below minimum ($${userCriteria.minLiquidity.toLocaleString()})`;
+                } else if (tokenData.volume24h < userCriteria.minVolume) {
+                    isValid = false;
+                    validationMessage = `❌ Failed: 24h Volume ($${tokenData.volume24h.toLocaleString()}) below minimum ($${userCriteria.minVolume.toLocaleString()})`;
+                } else if (userCriteria.maxAge && tokenData.ageSeconds > userCriteria.maxAge) {
+                    isValid = false;
+                    validationMessage = `❌ Failed: Age (${tokenData.age}) above maximum (${userCriteria.maxAge}s)`;
+                } else if (userCriteria.requireDexScreener && (!tokenData.price || tokenData.price === 0)) {
+                    isValid = false;
+                    validationMessage = `❌ Failed: DexScreener data required but not available or price is zero.`;
+                }
+
+                await this.botConfig.onLog(`🔍 Sniper Bot Validation: ${validationMessage}`, userId);
+
+                // Only attempt to snipe if user has a wallet for this network AND token is valid
+                if (isValid && this.hasUserWallet(userId, tokenData.network)) {
+                    await this.attemptSnipe(userId, tokenData);
+                } else if (!this.hasUserWallet(userId, tokenData.network)) {
+                    await this.botConfig.onLog(`⚠️ No ${tokenData.network} wallet configured. Cannot snipe this token.`, userId);
+                } else {
+                    await this.botConfig.onLog('➡️ Not sniping this token.', userId);
+                }
+            }
+        } catch (error) {
+            console.error('Error handling token detection:', error);
+        }
+    }
+
+    // Handle token scanner errors
+    private async handleTokenScannerError(error: Error) {
+        console.error('Enhanced Token Scanner error:', error);
+    }
+
+    // Set user validation criteria
+    setUserValidationCriteria(userId: number, criteria: TokenValidationCriteria) {
+        this.userValidationCriteria.set(userId, criteria);
+        
+        // Update scanner criteria if it exists
+        if (this.enhancedTokenScanner) {
+            this.enhancedTokenScanner.updateValidationCriteria(criteria);
+        }
+    }
+
+    // Get user validation criteria
+    getUserValidationCriteria(userId: number): TokenValidationCriteria | undefined {
+        return this.userValidationCriteria.get(userId);
+    }
+
+    // Get user's sniped tokens
+    getUserSnipedTokens(userId: number): TokenData[] {
+        return this.snipedTokens.get(userId) || [];
+    }
+
+    // Attempt to snipe a detected token
+    private async attemptSnipe(userId: number, tokenData: TokenData) {
+        try {
+            const userConfig = this.getUserConfig(userId);
+            if (!userConfig) {
+                console.log(`No config found for user ${userId}`);
+                return;
+            }
+
+            const wallet = this.getUserWallet(userId, tokenData.network);
+            if (!wallet) {
+                console.log(`No ${tokenData.network} wallet found for user ${userId}`);
+                return;
+            }
+
+            // Check if we have enough balance
+            const balance = await this.getWalletBalance(userId, tokenData.network);
+            const balanceNum = parseFloat(balance.split(' ')[0]);
+            
+            if (balanceNum < userConfig.amount) {
+                await this.botConfig.onLog(
+                    `⚠️ Insufficient ${tokenData.network} balance for sniping ${tokenData.symbol}`,
+                    userId
+                );
+                return;
+            }
+
+            // Attempt to snipe based on network
+            let txHash: string | TransactionResponse;
+            
+            if (tokenData.network === 'SOL') {
+                txHash = await this.executeSolSnipe(wallet, tokenData.address, userConfig.amount, userConfig.slippage);
+            } else {
+                txHash = await this.snipeEvmToken(userId, tokenData.network, tokenData.address, userConfig.amount, userConfig.slippage);
+            }
+
+            // Store sniped token
+            if (!this.snipedTokens.has(userId)) {
+                this.snipedTokens.set(userId, []);
+            }
+            this.snipedTokens.get(userId)!.push(tokenData);
+
+            // Create position
+            const position: TokenPosition = {
+                tokenAddress: tokenData.address,
+                amount: BigInt(Math.floor(userConfig.amount * 1e18)), // Convert to wei
+                entryPrice: BigInt(Math.floor(tokenData.price * 1e18)),
+                stopLoss: userConfig.stopLoss,
+                takeProfit: userConfig.takeProfit,
+                network: tokenData.network,
+                tokenSymbol: tokenData.symbol,
+                tokenName: tokenData.name,
+                entryTime: Math.floor(Date.now() / 1000),
+                currentPrice: 0
+            };
+
+            this.positions.set(`${userId}_${tokenData.address}`, position);
+
+            await this.botConfig.onLog(
+                `✅ Successfully Sniped ${tokenData.symbol}!\n\n` +
+                `💰 Amount: ${userConfig.amount} ${tokenData.network === 'ETH' ? 'ETH' : tokenData.network === 'BSC' ? 'BNB' : 'SOL'}\n` +
+                `📈 Entry Price: $${tokenData.price.toFixed(8)}\n` +
+                `📊 Stop Loss: ${userConfig.stopLoss}%\n` +
+                `🎯 Take Profit: ${userConfig.takeProfit}%\n` +
+                `🔗 [View Transaction](${NETWORK_CONFIGS[tokenData.network].explorer}${typeof txHash === 'string' ? txHash : txHash.hash})`,
+                userId
+            );
+
+        } catch (error) {
+            console.error(`Error sniping token for user ${userId}:`, error);
+            await this.botConfig.onError(error as Error, userId);
+        }
     }
 
     // Add public getter methods for callbacks
@@ -171,6 +357,11 @@ export class SniperBot {
 
         // Initial balance update
         this.updateWalletBalances(userId, network);
+
+        // Update scanner if bot is running and user has sufficient funds
+        if (this.isRunning && this.enhancedTokenScanner) {
+            this.updateScannerForUser(userId);
+        }
     }
 
     getUserWallet(userId: number, network: 'ETH' | 'BSC' | 'SOL'): any {
@@ -185,6 +376,11 @@ export class SniperBot {
     removeUserWallet(userId: number, network: 'ETH' | 'BSC' | 'SOL') {
         this.userWallets.get(userId)?.delete(network);
 
+        // Update scanner if bot is running
+        if (this.isRunning && this.enhancedTokenScanner) {
+            this.updateScannerForUser(userId);
+        }
+
         // If no wallets left, stop balance updates
         if (!this.hasUserWallet(userId, 'ETH') && !this.hasUserWallet(userId, 'BSC') && !this.hasUserWallet(userId, 'SOL')) {
             const interval = this.balanceUpdateIntervals.get(userId);
@@ -193,6 +389,47 @@ export class SniperBot {
                 this.balanceUpdateIntervals.delete(userId);
             }
             this.lastBalanceMessages.delete(userId);
+        }
+    }
+
+    // Helper method to update scanner networks for a user
+    private async updateScannerForUser(userId: number) {
+        if (!this.enhancedTokenScanner) return;
+
+        const config = this.userConfigs.get(userId) || this.botConfig;
+        const networksToScan: ('ETH' | 'BSC' | 'SOL')[] = [];
+        
+        for (const network of ['ETH', 'BSC', 'SOL'] as const) {
+            if (this.hasUserWallet(userId, network)) {
+                try {
+                    const balanceStr = await this.getWalletBalance(userId, network);
+                    const balance = parseFloat(balanceStr.split(' ')[0]);
+                    if (balance >= config.amount) {
+                        networksToScan.push(network);
+                    }
+                } catch (error) {
+                    console.error(`Error checking balance for ${network}:`, error);
+                }
+            }
+        }
+
+        // Get current active networks
+        const currentNetworks = Array.from(this.enhancedTokenScanner.getActiveNetworks());
+        
+        // Find networks to add
+        const networksToAdd = networksToScan.filter(network => !currentNetworks.includes(network));
+        
+        // Find networks to remove (if no other users have wallets for them)
+        const networksToRemove = currentNetworks.filter(network => !networksToScan.includes(network));
+
+        if (networksToAdd.length > 0) {
+            await this.enhancedTokenScanner.addNetworks(networksToAdd);
+            console.log(`➕ Added networks to scanner for user ${userId}:`, networksToAdd);
+        }
+
+        if (networksToRemove.length > 0) {
+            await this.enhancedTokenScanner.removeNetworks(networksToRemove);
+            console.log(`➖ Removed networks from scanner for user ${userId}:`, networksToRemove);
         }
     }
 
@@ -269,15 +506,17 @@ export class SniperBot {
         // Get user's configuration
         const config = this.userConfigs.get(userId) || this.botConfig;
 
-        // Check wallet balances
+        // Check wallet balances and determine which networks to scan
         let hasEnoughFunds = false;
+        const networksToScan: ('ETH' | 'BSC' | 'SOL')[] = [];
+        
         for (const network of ['ETH', 'BSC', 'SOL'] as const) {
             if (this.hasUserWallet(userId, network)) {
                 const balanceStr = await this.getWalletBalance(userId, network);
                 const balance = parseFloat(balanceStr.split(' ')[0]);
                 if (balance >= config.amount) {
                     hasEnoughFunds = true;
-                    break;
+                    networksToScan.push(network);
                 }
             }
         }
@@ -297,45 +536,48 @@ export class SniperBot {
         const solBalance = await this.getWalletBalance(userId, 'SOL');
         this.botConfig.onLog(`💰 Initial Balances:\n🔷 ETH: ${ethBalance}\n🟡 BSC: ${bscBalance}\n🟣 SOL: ${solBalance}`, userId);
 
-        // Start token scanner
-        await tokenScanner.startScanning();
+        // Initialize enhanced token scanner if not already done
+        if (!this.enhancedTokenScanner) {
+            await this.initializeEnhancedTokenScanner();
+        }
 
-        const interval = setInterval(async () => {
-            try {
-                // Check for new tokens
-                const tokens = tokenScanner.getTokenList();
-                if (tokens.length > 0) {
-                    this.botConfig.onLog(`🔍 Found ${tokens.length} potential tokens.`, userId);
-                }
+        // Start enhanced token scanner only for networks with active wallets
+        if (this.enhancedTokenScanner && !this.enhancedTokenScanner.isScanning()) {
+            await this.enhancedTokenScanner.startScanning(networksToScan);
+        } else if (this.enhancedTokenScanner && this.enhancedTokenScanner.isScanning()) {
+            // If scanner is already running, add the new networks
+            await this.enhancedTokenScanner.addNetworks(networksToScan);
+        }
 
-                for (const token of tokens) {
-                    if (this.hasUserWallet(userId, token.network)) {
-                        try {
-                            // Validate token before attempting to buy
-                            if (await this.validateToken(token.mint, token.network)) {
-                                this.botConfig.onLog(`Attempting to snipe ${token.name} (${token.mint}) on ${token.network}...`, userId);
-                                if (token.network === 'SOL') {
-                                    const wallet = this.getUserWallet(userId, token.network);
-                                    await this.executeSolSnipe(wallet, token.mint, config.amount, config.slippage);
-                                } else {
-                                    await this.snipeEvmToken(userId, token.network, token.mint, config.amount, config.slippage);
-                                }
-                                this.botConfig.onLog(`🎯 Successfully sniped ${token.name} on ${token.network}.`, userId);
-                            } else {
-                                this.botConfig.onLog(`⚠️ Token ${token.mint} on ${token.network} failed validation.`, userId);
-                            }
-                        } catch (error) {
-                            this.botConfig.onLog(`❌ Failed to snipe ${token.mint} on ${token.network}: ${(error as Error).message}`, userId);
-                            this.botConfig.onError(error as Error, userId);
-                        }
-                    }
-                }
-            } catch (error) {
-                this.botConfig.onError(error as Error, userId);
+        // Set default validation criteria for user if not set
+        if (!this.userValidationCriteria.has(userId)) {
+            this.setUserValidationCriteria(userId, {
+                minLiquidity: 1000,
+                minVolume: 25,
+                requireDexScreener: true
+            });
+        }
+
+        this.botConfig.onLog('🔍 Enhanced Token Scanner is now monitoring for new tokens with validation criteria:\n' +
+            `💧 Min Liquidity: $${this.userValidationCriteria.get(userId)?.minLiquidity || 1000}\n` +
+            `📊 Min Volume: $${this.userValidationCriteria.get(userId)?.minVolume || 25}\n` +
+            `✅ DexScreener Required: ${this.userValidationCriteria.get(userId)?.requireDexScreener || true}\n\n` +
+            `📡 Scanning networks: ${networksToScan.join(', ')}`, userId);
+
+        // Start position monitoring
+        this.startPositionMonitoring(userId);
+
+        // Set up balance update interval
+        const balanceInterval = setInterval(async () => {
+            if (this.stopFlag) {
+                clearInterval(balanceInterval);
+                return;
             }
-        }, 15000);
+            await this.updateWalletBalances(userId);
+        }, 60000); // Update every minute
 
-        this.monitoringIntervals.set(userId, interval);
+        this.balanceUpdateIntervals.set(userId, balanceInterval);
+        this.monitoringIntervals.set(userId, balanceInterval);
     }
 
     stopBackgroundMonitoring(userId: number) {
@@ -343,9 +585,17 @@ export class SniperBot {
         if (interval) {
             clearInterval(interval);
             this.monitoringIntervals.delete(userId);
-            tokenScanner.stopScanning();
+            
+            // Stop enhanced token scanner if no other users are monitoring
+            if (this.monitoringIntervals.size === 0 && this.enhancedTokenScanner) {
+                this.enhancedTokenScanner.stopScanning();
+            }
+            
             this.botConfig.onLog('🛑 Sniper Bot stopped for this user.', userId);
         }
+
+        // Stop position monitoring
+        this.stopPositionMonitoring(userId);
 
         // Clear balance update interval
         const balanceInterval = this.balanceUpdateIntervals.get(userId);
@@ -363,7 +613,7 @@ export class SniperBot {
             await raydiumSwap.loadPoolKeys();
 
             // Find pool info
-            const poolKeys = await raydiumSwap.findRaydiumPoolInfo(WSOL_ADDRESS, tokenAddress);
+            const poolKeys = await raydiumSwap.findRaydiumPoolInfo(tokenAddress, WSOL_ADDRESS.toString());
             if (!poolKeys) {
                 throw new Error('Pool not found for token');
             }
@@ -639,7 +889,11 @@ export class SniperBot {
                     entryPrice: await this.getTokenPrice(tokenAddress, network),
                     stopLoss: this.botConfig.stopLoss,
                     takeProfit: this.botConfig.takeProfit,
-                    network
+                    network,
+                    tokenSymbol: '',
+                    tokenName: '',
+                    entryTime: 0,
+                    currentPrice: 0
                 });
             }
 
@@ -655,6 +909,209 @@ export class SniperBot {
         } catch (error) {
             this.botConfig.onError(error as Error, userId);
             throw error; // Re-throw to be caught by Telegram handler
+        }
+    }
+
+    // Start position monitoring for a user
+    private startPositionMonitoring(userId: number) {
+        // Clear existing monitoring if any
+        const existingInterval = this.positionMonitoringIntervals.get(userId);
+        if (existingInterval) {
+            clearInterval(existingInterval);
+        }
+
+        // Start new monitoring interval
+        const monitoringInterval = setInterval(async () => {
+            if (this.stopFlag) {
+                clearInterval(monitoringInterval);
+                return;
+            }
+            await this.monitorPositions(userId);
+        }, 10000); // Check every 10 seconds
+
+        this.positionMonitoringIntervals.set(userId, monitoringInterval);
+    }
+
+    // Stop position monitoring for a user
+    private stopPositionMonitoring(userId: number) {
+        const interval = this.positionMonitoringIntervals.get(userId);
+        if (interval) {
+            clearInterval(interval);
+            this.positionMonitoringIntervals.delete(userId);
+        }
+    }
+
+    // Monitor all positions for a user
+    private async monitorPositions(userId: number) {
+        try {
+            const userPositions = Array.from(this.positions.entries())
+                .filter(([key]) => key.startsWith(`${userId}_`));
+
+            for (const [positionKey, position] of userPositions) {
+                await this.checkPositionPrice(userId, positionKey, position);
+            }
+        } catch (error) {
+            console.error(`Error monitoring positions for user ${userId}:`, error);
+        }
+    }
+
+    // Check price for a specific position
+    private async checkPositionPrice(userId: number, positionKey: string, position: TokenPosition) {
+        try {
+            // Get current price from DexScreener
+            const currentPrice = await this.getCurrentTokenPrice(position.tokenAddress, position.network);
+            if (currentPrice === null) {
+                return; // Skip if price couldn't be fetched
+            }
+
+            // Update position with current price
+            position.currentPrice = currentPrice;
+            this.positions.set(positionKey, position);
+
+            const entryPrice = Number(position.entryPrice) / 1e18;
+            const priceChange = ((currentPrice - entryPrice) / entryPrice) * 100;
+
+            // Check take profit
+            if (priceChange >= position.takeProfit) {
+                await this.executeSell(userId, positionKey, position, 'TAKE_PROFIT', priceChange);
+                return;
+            }
+
+            // Check stop loss
+            if (priceChange <= -position.stopLoss) {
+                await this.executeSell(userId, positionKey, position, 'STOP_LOSS', priceChange);
+                return;
+            }
+
+            // Log significant price movements (every 5% change)
+            const lastLoggedChange = this.lastPriceLogs.get(positionKey) || 0;
+            if (Math.abs(priceChange - lastLoggedChange) >= 5) {
+                await this.botConfig.onLog(
+                    `📊 ${position.tokenSymbol} Price Update:\n` +
+                    `💰 Current Price: $${currentPrice.toFixed(8)}\n` +
+                    `📈 Entry Price: $${entryPrice.toFixed(8)}\n` +
+                    `📊 Change: ${priceChange > 0 ? '+' : ''}${priceChange.toFixed(2)}%\n` +
+                    `🎯 TP: ${position.takeProfit}% | 🛑 SL: ${position.stopLoss}%`,
+                    userId
+                );
+                this.lastPriceLogs.set(positionKey, priceChange);
+            }
+
+        } catch (error) {
+            console.error(`Error checking price for position ${positionKey}:`, error);
+        }
+    }
+
+    // Execute sell order
+    private async executeSell(userId: number, positionKey: string, position: TokenPosition, reason: 'TAKE_PROFIT' | 'STOP_LOSS', priceChange: number) {
+        try {
+            const entryPrice = Number(position.entryPrice) / 1e18;
+            const currentPrice = position.currentPrice;
+            const profitLoss = ((currentPrice - entryPrice) / entryPrice) * 100;
+
+            // Attempt to sell the token
+            if (position.network === 'SOL') {
+                await this.executeSolSell(userId, position);
+            } else {
+                await this.sellToken(userId, position.tokenAddress, position);
+            }
+
+            // Remove position from tracking
+            this.positions.delete(positionKey);
+            this.lastPriceLogs.delete(positionKey);
+
+            // Calculate profit/loss in USD
+            const investedAmount = Number(position.amount) / 1e18;
+            const profitLossUSD = (investedAmount * profitLoss) / 100;
+
+            const emoji = reason === 'TAKE_PROFIT' ? '🎯' : '🛑';
+            const reasonText = reason === 'TAKE_PROFIT' ? 'Take Profit Reached!' : 'Stop Loss Triggered!';
+
+            await this.botConfig.onLog(
+                `${emoji} ${reasonText}\n\n` +
+                `🪙 Token: ${position.tokenSymbol} (${position.tokenName})\n` +
+                `💰 Invested: ${investedAmount.toFixed(4)} ${position.network === 'ETH' ? 'ETH' : position.network === 'BSC' ? 'BNB' : 'SOL'}\n` +
+                `📈 Entry Price: $${entryPrice.toFixed(8)}\n` +
+                `📊 Exit Price: $${currentPrice.toFixed(8)}\n` +
+                `📊 P&L: ${profitLoss > 0 ? '+' : ''}${profitLoss.toFixed(2)}% (${profitLossUSD > 0 ? '+' : ''}$${profitLossUSD.toFixed(2)})\n` +
+                `🌐 Network: ${position.network}`,
+                userId
+            );
+
+        } catch (error) {
+            console.error(`Error executing sell for position ${positionKey}:`, error);
+            await this.botConfig.onError(error as Error, userId);
+        }
+    }
+
+    // Get current token price from DexScreener
+    private async getCurrentTokenPrice(tokenAddress: string, network: 'ETH' | 'BSC' | 'SOL'): Promise<number | null> {
+        try {
+            let url: string;
+            if (network === 'SOL') {
+                url = `https://api.dexscreener.com/latest/dex/pairs/solana/${tokenAddress}`;
+            } else {
+                url = `https://api.dexscreener.com/latest/dex/tokens/${tokenAddress}`;
+            }
+
+            const response = await fetch(url);
+            const data = await response.json() as any;
+
+            if (network === 'SOL') {
+                return data.pair ? parseFloat(data.pair.priceUsd) : null;
+            } else {
+                return data.pairs && data.pairs.length > 0 ? parseFloat(data.pairs[0].priceUsd) : null;
+            }
+        } catch (error) {
+            console.error(`Error fetching price for ${tokenAddress}:`, error);
+            return null;
+        }
+    }
+
+    // Execute Solana sell
+    private async executeSolSell(userId: number, position: TokenPosition): Promise<void> {
+        try {
+            const wallet = this.getUserWallet(userId, 'SOL');
+            if (!wallet) {
+                throw new Error('No SOL wallet found');
+            }
+
+            // Use RaydiumSwap for selling
+            const raydiumSwap = new RaydiumSwap(NETWORK_CONFIGS.SOL.rpc, wallet.privateKey);
+            await raydiumSwap.loadPoolKeys();
+
+            // Find pool info
+            const poolKeys = await raydiumSwap.findRaydiumPoolInfo(position.tokenAddress, WSOL_ADDRESS.toString());
+            if (!poolKeys) {
+                throw new Error('Pool not found for token');
+            }
+
+            // Get swap transaction (selling token for SOL)
+            const swapTx = await raydiumSwap.getSwapTransaction(
+                WSOL_ADDRESS.toString(), // Selling token for SOL
+                Number(position.amount) / 1e9, // Convert from lamports
+                poolKeys,
+                true, // use versioned transaction
+                5 // 5% slippage
+            );
+
+            // Send transaction
+            let txHash: string;
+            if (swapTx instanceof VersionedTransaction) {
+                const { blockhash, lastValidBlockHeight } = await raydiumSwap.connection.getLatestBlockhash();
+                txHash = await raydiumSwap.sendVersionedTransaction(swapTx, blockhash, lastValidBlockHeight);
+            } else {
+                txHash = await raydiumSwap.sendLegacyTransaction(swapTx as Transaction);
+            }
+
+            await this.botConfig.onLog(
+                `✅ Sold ${position.tokenSymbol} on Solana\n` +
+                `🔗 [View Transaction](${NETWORK_CONFIGS.SOL.explorer}${txHash})`,
+                userId
+            );
+
+        } catch (error) {
+            throw error;
         }
     }
 }

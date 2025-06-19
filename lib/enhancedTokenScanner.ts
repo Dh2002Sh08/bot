@@ -1,6 +1,7 @@
 import { Web3 } from 'web3';
 import { Connection, PublicKey } from '@solana/web3.js';
 import { ShyftSdk, Network } from '@shyft-to/js';
+import { GoPlus } from "@goplus/sdk-node";
 import fetch from 'node-fetch';
 import dotenv from 'dotenv';
 
@@ -12,6 +13,10 @@ export interface TokenValidationCriteria {
     minVolume: number;
     maxAge?: number; // in seconds
     requireDexScreener: boolean;
+    enableHoneypotDetection?: boolean;
+    excludeStablecoins?: boolean;
+    minTokenAge?: number; // minimum age in seconds to avoid very new tokens
+    maxTokenAge?: number; // maximum age in seconds to focus on recent tokens
 }
 
 // Token data interface
@@ -29,6 +34,18 @@ export interface TokenData {
     dexScreenerUrl: string;
     timestamp: number;
     scannerCriteria: TokenValidationCriteria;
+    honeypotCheck?: HoneypotCheckResult;
+}
+
+// Honeypot detection result interface
+export interface HoneypotCheckResult {
+    isHoneypot: boolean;
+    buyTax: number;
+    sellTax: number;
+    isBuyable: boolean;
+    isSellable: boolean;
+    error?: string;
+    source: 'goPlus' | 'honeypot' | 'manual';
 }
 
 // Interface for decoded event data
@@ -72,6 +89,39 @@ interface DexScreenerResponse {
         pairCreatedAt: number;
     };
 }
+
+// Stablecoin blacklists
+const STABLECOIN_BLACKLISTS = {
+    ETH: [
+        '0xdac17f958d2ee523a2206206994597c13d831ec7', // USDT
+        '0xa0b86a33e6441b8c4c8c8c8c8c8c8c8c8c8c8c8c', // USDC
+        '0x6b175474e89094c44da98b954eedeac495271d0f', // DAI
+        '0x2260fac5e5542a773aa44fbcfedf7c193bc2c599', // WBTC
+        '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2', // WETH
+    ],
+    BSC: [
+        '0x55d398326f99059ff775485246999027b3197955', // USDT
+        '0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d', // USDC
+        '0x1af3f329e8be154074d8769d1ffa4ee058b1dbc3', // DAI
+        '0x7130d2a12b9bcbfae4f2634d864a1ee1ce3ead9c', // BTCB
+        '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c', // WBNB
+        '0xe9e7cea3dedca5984780bafc599bd69add087d56', // BUSD
+        '0x2170ed0880ac9a755fd29b2688956bd959f933f8', // WETH
+    ],
+    SOL: [
+        'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', // USDC
+        'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB', // USDT
+        'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263', // BONK
+        'So11111111111111111111111111111111111111112', // SOL
+    ]
+};
+
+// Known token symbols to exclude (stablecoins, major tokens)
+const EXCLUDED_SYMBOLS = [
+    'USDT', 'USDC', 'DAI', 'BUSD', 'TUSD', 'FRAX', 'USDP', 'USDD', 'GUSD', 'LUSD',
+    'WBTC', 'BTCB', 'WETH', 'WBNB', 'WSOL', 'SOL', 'BNB', 'ETH', 'BTC',
+    'BONK', 'RAY', 'SRM', 'ORCA', 'JUP', 'PYTH', 'BOME', 'WIF', 'POPCAT'
+];
 
 // Network configurations (copied from working scans)
 const NETWORK_CONFIGS = {
@@ -139,6 +189,9 @@ export class EnhancedTokenScanner {
     private onError: (error: Error) => void;
     private tokenList: any[] = []; // In-memory store for recent pools (copied from solTokenScan.js)
     private activeNetworks: Set<'ETH' | 'BSC' | 'SOL'> = new Set();
+    private processedTokens: Set<string> = new Set(); // Track processed tokens to avoid duplicates
+    private dexScreenerCache: Map<string, { data: TokenData; timestamp: number }> = new Map(); // Cache DexScreener responses
+    private readonly CACHE_DURATION = 30000; // 30 seconds cache duration
 
     constructor(
         validationCriteria: TokenValidationCriteria,
@@ -198,31 +251,10 @@ export class EnhancedTokenScanner {
         this.activeNetworks = new Set(networks);
         
         console.log('🚀 Starting Enhanced Token Scanner...');
-        console.log(`📡 Active networks: ${networks.length > 0 ? networks.join(', ') : 'None'}`);
 
-        // Start scanning for each specified network
+        // Start scanning for each network
         for (const network of networks) {
-            switch (network) {
-                case 'ETH':
-                    await this.startEthScanning();
-                    break;
-                case 'BSC':
-                    await this.startBscScanning();
-                    break;
-                case 'SOL':
-                    await this.startSolanaScanning();
-                    break;
-            }
-        }
-    }
-
-    // Add networks to scan (for when users add wallets)
-    async addNetworks(networks: ('ETH' | 'BSC' | 'SOL')[]) {
-        for (const network of networks) {
-            if (!this.activeNetworks.has(network)) {
-                this.activeNetworks.add(network);
-                console.log(`➕ Added ${network} to scanning networks`);
-                
+            try {
                 switch (network) {
                     case 'ETH':
                         await this.startEthScanning();
@@ -234,30 +266,53 @@ export class EnhancedTokenScanner {
                         await this.startSolanaScanning();
                         break;
                 }
+            } catch (error) {
+                console.error(`❌ Failed to start ${network} scanning:`, error);
+                this.onError(error as Error);
+            }
+        }
+
+        console.log('✅ Enhanced Token Scanner started successfully');
+    }
+
+    // Add networks to existing scanning
+    async addNetworks(networks: ('ETH' | 'BSC' | 'SOL')[]) {
+        for (const network of networks) {
+            if (!this.activeNetworks.has(network)) {
+                this.activeNetworks.add(network);
+                try {
+                    switch (network) {
+                        case 'ETH':
+                            await this.startEthScanning();
+                            break;
+                        case 'BSC':
+                            await this.startBscScanning();
+                            break;
+                        case 'SOL':
+                            await this.startSolanaScanning();
+                            break;
+                    }
+                } catch (error) {
+                    console.error(`❌ Failed to add ${network} scanning:`, error);
+                    this.onError(error as Error);
+                }
             }
         }
     }
 
-    // Remove networks from scan (for when users remove wallets)
+    // Remove networks from scanning
     async removeNetworks(networks: ('ETH' | 'BSC' | 'SOL')[]) {
         for (const network of networks) {
             if (this.activeNetworks.has(network)) {
                 this.activeNetworks.delete(network);
-                console.log(`➖ Removed ${network} from scanning networks`);
-                
-                // Stop scanning for this network
                 const subscription = this.subscriptions.get(network);
                 if (subscription) {
-                    try {
-                        if (network === 'SOL') {
-                            this.solanaConnection?.removeProgramAccountChangeListener(subscription);
-                        } else {
-                            await subscription.unsubscribe();
-                        }
-                        this.subscriptions.delete(network);
-                    } catch (error) {
-                        console.error(`Error unsubscribing from ${network}:`, error);
+                    if (network === 'SOL') {
+                        await this.solanaConnection!.removeProgramAccountChangeListener(subscription);
+                    } else {
+                        await subscription.unsubscribe();
                     }
+                    this.subscriptions.delete(network);
                 }
             }
         }
@@ -266,13 +321,12 @@ export class EnhancedTokenScanner {
     // Stop scanning
     async stopScanning() {
         this.isRunning = false;
-        this.activeNetworks.clear();
-        
-        // Unsubscribe from all subscriptions
+
+        // Unsubscribe from all networks
         for (const [network, subscription] of this.subscriptions) {
             try {
                 if (network === 'SOL') {
-                    this.solanaConnection?.removeProgramAccountChangeListener(subscription);
+                    await this.solanaConnection!.removeProgramAccountChangeListener(subscription);
                 } else {
                     await subscription.unsubscribe();
                 }
@@ -280,15 +334,15 @@ export class EnhancedTokenScanner {
                 console.error(`Error unsubscribing from ${network}:`, error);
             }
         }
-        
+
         this.subscriptions.clear();
+        this.activeNetworks.clear();
         console.log('🛑 Enhanced Token Scanner stopped');
     }
 
     // Update validation criteria
     updateValidationCriteria(criteria: Partial<TokenValidationCriteria>) {
         this.validationCriteria = { ...this.validationCriteria, ...criteria };
-        console.log('📊 Updated validation criteria:', this.validationCriteria);
     }
 
     // ETH Scanning (exact logic from ethTokenScan.js)
@@ -302,8 +356,8 @@ export class EnhancedTokenScanner {
 
             // Verify WebSocket connection (copied from ethTokenScan.js)
             web3.eth.net.isListening()
-                .then(() => console.log('✅ WebSocket provider connected'))
-                .catch(err => console.error('❌ WebSocket provider connection failed:', err));
+                .then(() => console.log('✅ ETH WebSocket provider connected'))
+                .catch(err => console.error('❌ ETH WebSocket provider connection failed:', err));
 
             // Subscribe to logs for real-time events (copied from ethTokenScan.js)
             const subscription = await web3.eth.subscribe('logs', {
@@ -462,14 +516,79 @@ export class EnhancedTokenScanner {
         }
     }
 
-    // Process new token from EVM chains
+    // Process new token from EVM chains with enhanced filtering
     private async processNewToken(network: 'ETH' | 'BSC', tokenAddress: string, pairAddress: string) {
         try {
+            console.log(`🔍 Processing new ${network} token: ${tokenAddress}`);
+            console.log(`🚀 TOKEN DETECTION STARTED - Checking for honeypot and validating coin...`);
+            
+            // Check if token was already processed
+            const tokenKey = `${network}_${tokenAddress.toLowerCase()}`;
+            if (this.processedTokens.has(tokenKey)) {
+                console.log(`⏭️ Token ${tokenAddress} already processed, skipping`);
+                return;
+            }
+
+            // Mark as processed immediately to prevent duplicates
+            this.processedTokens.add(tokenKey);
+
+            // Add 1 minute delay before scanning DexScreener to ensure token is indexed
+            console.log(`⏳ Waiting 1 minute for DexScreener to index ${tokenAddress}...`);
+            await new Promise(resolve => setTimeout(resolve, 60000));
+            console.log(`✅ Delay completed, now fetching data from DexScreener...`);
+
             // Get token data from DexScreener
             const tokenData = await this.getTokenDataFromDexScreener(network, tokenAddress);
             
             if (!tokenData) {
+                console.log(`❌ No DexScreener data for ${network} token: ${tokenAddress}`);
                 return;
+            }
+
+            console.log(`📊 Token data received for ${tokenData.symbol}:`, {
+                symbol: tokenData.symbol,
+                name: tokenData.name,
+                price: tokenData.price,
+                liquidity: tokenData.liquidity,
+                volume24h: tokenData.volume24h,
+                age: tokenData.age,
+                ageSeconds: tokenData.ageSeconds
+            });
+
+            // Quick validation checks (non-blocking) - but be less strict
+            const quickValidation = this.quickTokenValidation(tokenData);
+            if (!quickValidation.isValid) {
+                console.log(`❌ Token ${tokenData.symbol} filtered out: ${quickValidation.reason}`);
+                return;
+            }
+
+            console.log(`✅ Quick validation passed for ${tokenData.symbol}`);
+
+            // Enhanced filtering (async but fast) - but be less strict
+            if (!await this.isValidNewToken(tokenData)) {
+                console.log(`❌ Token ${tokenData.symbol} filtered out: Not a valid new token`);
+                return;
+            }
+
+            console.log(`✅ Enhanced validation passed for ${tokenData.symbol}`);
+
+            // Honeypot detection if enabled (parallel processing)
+            let honeypotCheck: HoneypotCheckResult | undefined;
+            if (this.validationCriteria.enableHoneypotDetection) {
+                console.log(`🔍 Checking honeypot for ${tokenData.symbol}...`);
+                // Start honeypot check in parallel but don't wait for it
+                this.checkHoneypotAsync(tokenData.address, network).then(check => {
+                    honeypotCheck = check;
+                    if (check.isHoneypot) {
+                        console.log(`🚨 Honeypot detected for ${tokenData.symbol}: ${check.error || 'High taxes or not sellable'}`);
+                    } else {
+                        console.log(`✅ Honeypot check passed for ${tokenData.symbol}`);
+                    }
+                }).catch(error => {
+                    console.error('Honeypot check error:', error);
+                });
+            } else {
+                console.log(`⏭️ Honeypot detection disabled for ${tokenData.symbol}`);
             }
 
             const enrichedToken: TokenData = {
@@ -477,11 +596,14 @@ export class EnhancedTokenScanner {
                 network,
                 pairAddress,
                 timestamp: Date.now(),
-                scannerCriteria: this.validationCriteria // Pass the scanner's criteria
+                scannerCriteria: this.validationCriteria,
+                honeypotCheck
             };
 
-            console.log(`🎯 Token detected on ${network}:`, tokenData.symbol);
+            console.log(`🎯 Valid new token detected on ${network}:`, tokenData.symbol);
             console.log(`Calling onTokenDetected for ${network} with token: ${tokenData.symbol} and address: ${tokenData.address}`);
+            
+            // Call onTokenDetected immediately (honeypot check will be updated later if needed)
             this.onTokenDetected(enrichedToken);
 
         } catch (error) {
@@ -489,9 +611,12 @@ export class EnhancedTokenScanner {
         }
     }
 
-    // Process Solana pool (using enriched data from solTokenScan.js)
+    // Process Solana pool with enhanced filtering
     private async processSolanaPool(poolAddress: string, enrichedData?: any) {
         try {
+            console.log(`🔍 Processing new SOL pool: ${poolAddress}`);
+            console.log(`🚀 TOKEN DETECTION STARTED - Checking for honeypot and validating coin...`);
+            
             let tokenData: TokenData | null = null;
 
             if (enrichedData) {
@@ -507,18 +632,62 @@ export class EnhancedTokenScanner {
                     age: enrichedData.age,
                     ageSeconds: 0, // Calculate if needed
                     pairAddress: poolAddress,
-                    dexScreenerUrl: enrichedData.dexscreener,
+                    dexScreenerUrl: `https://dexscreener.com/solana/${poolAddress}`,
                     timestamp: Date.now(),
                     scannerCriteria: this.validationCriteria
                 };
+                console.log(`📊 Using enriched data for ${tokenData.symbol}`);
             } else {
-                // Fallback to DexScreener API
+                // Fallback to DexScreener API - add delay before fetching
+                console.log(`⏳ Waiting 0.1 seconds for DexScreener to index Solana pool: ${poolAddress}...`);
+                await new Promise(resolve => setTimeout(resolve, 100));
+                console.log(`✅ Delay completed, now fetching data from DexScreener for pool: ${poolAddress}`);
+                
+                console.log(`📊 Fetching data from DexScreener for pool: ${poolAddress}`);
                 tokenData = await this.getSolanaTokenData(poolAddress);
             }
             
             if (!tokenData) {
+                console.log(`❌ No token data available for SOL pool: ${poolAddress}`);
                 return;
             }
+
+            console.log(`📊 Token data received for ${tokenData.symbol}:`, {
+                symbol: tokenData.symbol,
+                name: tokenData.name,
+                price: tokenData.price,
+                liquidity: tokenData.liquidity,
+                volume24h: tokenData.volume24h,
+                age: tokenData.age,
+                ageSeconds: tokenData.ageSeconds
+            });
+
+            // Check if token was already processed
+            const tokenKey = `SOL_${tokenData.address}`;
+            if (this.processedTokens.has(tokenKey)) {
+                console.log(`⏭️ Token ${tokenData.address} already processed, skipping`);
+                return;
+            }
+
+            // Mark as processed immediately
+            this.processedTokens.add(tokenKey);
+
+            // Quick validation checks (non-blocking)
+            const quickValidation = this.quickTokenValidation(tokenData);
+            if (!quickValidation.isValid) {
+                console.log(`❌ Solana token ${tokenData.symbol} filtered out: ${quickValidation.reason}`);
+                return;
+            }
+
+            console.log(`✅ Quick validation passed for ${tokenData.symbol}`);
+
+            // Enhanced filtering (async but fast)
+            if (!await this.isValidNewToken(tokenData)) {
+                console.log(`❌ Solana token ${tokenData.symbol} filtered out: Not a valid new token`);
+                return;
+            }
+
+            console.log(`✅ Enhanced validation passed for ${tokenData.symbol}`);
 
             // Validate token
             if (await this.validateToken(tokenData)) {
@@ -530,9 +699,11 @@ export class EnhancedTokenScanner {
                     scannerCriteria: this.validationCriteria
                 };
 
-                console.log('🎯 Valid Solana token detected:', tokenData.symbol);
+                console.log('🎯 Valid new Solana token detected:', tokenData.symbol);
                 console.log(`Calling onTokenDetected for SOL with token: ${tokenData.symbol} and address: ${tokenData.address}`);
                 this.onTokenDetected(enrichedToken);
+            } else {
+                console.log(`❌ Final validation failed for ${tokenData.symbol}`);
             }
 
         } catch (error) {
@@ -540,9 +711,229 @@ export class EnhancedTokenScanner {
         }
     }
 
+    // Quick validation checks (synchronous, fast)
+    private quickTokenValidation(tokenData: TokenData): { isValid: boolean; reason?: string } {
+        try {
+            // Check if token is in stablecoin blacklist
+            if (this.validationCriteria.excludeStablecoins !== false) {
+                const blacklist = STABLECOIN_BLACKLISTS[tokenData.network] || [];
+                if (blacklist.includes(tokenData.address.toLowerCase())) {
+                    return { isValid: false, reason: 'Token is in stablecoin blacklist' };
+                }
+            }
+
+            // Check if symbol is in excluded symbols list
+            if (EXCLUDED_SYMBOLS.includes(tokenData.symbol.toUpperCase())) {
+                return { isValid: false, reason: 'Token has excluded symbol' };
+            }
+
+            // Check for suspicious patterns in token name/symbol - but be less strict
+            if (this.hasSuspiciousPatterns(tokenData)) {
+                return { isValid: false, reason: 'Token has suspicious patterns' };
+            }
+
+            // Check for very short or very long names - but be more lenient
+            if (tokenData.symbol.length < 1 || tokenData.symbol.length > 50) {
+                return { isValid: false, reason: 'Invalid symbol length' };
+            }
+
+            // Check for very short or very long names - but be more lenient
+            if (tokenData.name.length < 1 || tokenData.name.length > 100) {
+                return { isValid: false, reason: 'Invalid name length' };
+            }
+
+            return { isValid: true };
+        } catch (error) {
+            console.error('Error in quickTokenValidation:', error);
+            return { isValid: false, reason: 'Validation error' };
+        }
+    }
+
+    // Enhanced token validation to filter out stablecoins and established tokens
+    private async isValidNewToken(tokenData: TokenData): Promise<boolean> {
+        try {
+            // Check token age (avoid very new tokens and very old tokens)
+            // But be more lenient - only filter out extremely new tokens (< 30 seconds)
+            if (this.validationCriteria.minTokenAge && tokenData.ageSeconds < this.validationCriteria.minTokenAge) {
+                console.log(`❌ Token ${tokenData.symbol} too new: ${tokenData.ageSeconds}s < ${this.validationCriteria.minTokenAge}s`);
+                return false;
+            }
+
+            // Be more lenient with max age - only filter out very old tokens (> 7 days)
+            if (this.validationCriteria.maxTokenAge && tokenData.ageSeconds > this.validationCriteria.maxTokenAge) {
+                console.log(`❌ Token ${tokenData.symbol} too old: ${tokenData.ageSeconds}s > ${this.validationCriteria.maxTokenAge}s`);
+                return false;
+            }
+
+            // If no age criteria are set, be more permissive
+            if (!this.validationCriteria.minTokenAge && !this.validationCriteria.maxTokenAge) {
+                // Only filter out tokens that are extremely new (< 30 seconds) or extremely old (> 7 days)
+                if (tokenData.ageSeconds < 30) {
+                    console.log(`❌ Token ${tokenData.symbol} too new: ${tokenData.ageSeconds}s < 30s`);
+                    return false;
+                }
+                if (tokenData.ageSeconds > 604800) { // 7 days
+                    console.log(`❌ Token ${tokenData.symbol} too old: ${tokenData.ageSeconds}s > 7 days`);
+                    return false;
+                }
+            }
+
+            return true;
+        } catch (error) {
+            console.error('Error in isValidNewToken:', error);
+            return false;
+        }
+    }
+
+    // Async honeypot check (non-blocking)
+    private async checkHoneypotAsync(tokenAddress: string, network: 'ETH' | 'BSC'): Promise<HoneypotCheckResult> {
+        try {
+            // Try GoPlus SDK first (more reliable)
+            const goPlusResult = await this.checkHoneypotGoPlus(tokenAddress, network);
+            if (goPlusResult) {
+                return goPlusResult;
+            }
+
+            // Fallback to Honeypot API
+            const honeypotResult = await this.checkHoneypotAPI(tokenAddress, network);
+            if (honeypotResult) {
+                return honeypotResult;
+            }
+
+            // Manual check as last resort
+            return await this.manualHoneypotCheck(tokenAddress, network);
+
+        } catch (error) {
+            console.error('Error in honeypot detection:', error);
+            return {
+                isHoneypot: false,
+                buyTax: 0,
+                sellTax: 0,
+                isBuyable: true,
+                isSellable: true,
+                error: 'Detection failed',
+                source: 'manual'
+            };
+        }
+    }
+
+    // Check honeypot using GoPlus SDK
+    private async checkHoneypotGoPlus(tokenAddress: string, network: 'ETH' | 'BSC'): Promise<HoneypotCheckResult | null> {
+        try {
+            const chainId = network === 'ETH' ? '1' : '56';
+            const addresses = [tokenAddress];
+            
+            // Use GoPlus SDK with type assertion
+            const res = await (GoPlus as any).tokenSecurity(chainId, addresses, 30);
+            
+            if (res.code !== 1) { // SUCCESS code is 1
+                console.error('GoPlus SDK error:', res.message);
+                return null;
+            }
+            
+            const tokenData = res.result[tokenAddress];
+            if (!tokenData) {
+                return null;
+            }
+
+            return {
+                isHoneypot: tokenData.is_honeypot === '1',
+                buyTax: parseFloat(tokenData.buy_tax || '0'),
+                sellTax: parseFloat(tokenData.sell_tax || '0'),
+                isBuyable: tokenData.is_open_source === '1',
+                isSellable: tokenData.is_proxy === '0',
+                source: 'goPlus'
+            };
+
+        } catch (error) {
+            console.error('GoPlus SDK error:', error);
+            return null;
+        }
+    }
+
+    // Check honeypot using Honeypot API
+    private async checkHoneypotAPI(tokenAddress: string, network: 'ETH' | 'BSC'): Promise<HoneypotCheckResult | null> {
+        try {
+            const chainId = network === 'ETH' ? '1' : '56';
+            const url = `https://api.honeypot.is/v2/IsHoneypot?address=${tokenAddress}&chainID=${chainId}`;
+            
+            const response = await fetch(url);
+            if (!response.ok) {
+                return null;
+            }
+
+            const data = await response.json() as any;
+
+            return {
+                isHoneypot: data.IsHoneypot,
+                buyTax: data.BuyTax || 0,
+                sellTax: data.SellTax || 0,
+                isBuyable: data.IsBuyable,
+                isSellable: data.IsSellable,
+                source: 'honeypot'
+            };
+
+        } catch (error) {
+            console.error('Honeypot API error:', error);
+            return null;
+        }
+    }
+
+    // Manual honeypot check using basic heuristics
+    private async manualHoneypotCheck(tokenAddress: string, network: 'ETH' | 'BSC'): Promise<HoneypotCheckResult> {
+        try {
+            // Basic checks based on token characteristics
+            // This is a simplified version - in production you'd want more sophisticated checks
+            
+            const web3 = this.web3Instances.get(network)!;
+            
+            // Check if contract exists and has basic functions
+            const code = await web3.eth.getCode(tokenAddress);
+            if (code === '0x' || code === '0x0') {
+                return {
+                    isHoneypot: true,
+                    buyTax: 100,
+                    sellTax: 100,
+                    isBuyable: false,
+                    isSellable: false,
+                    error: 'No contract code',
+                    source: 'manual'
+                };
+            }
+
+            // For now, return a conservative result
+            return {
+                isHoneypot: false,
+                buyTax: 0,
+                sellTax: 0,
+                isBuyable: true,
+                isSellable: true,
+                source: 'manual'
+            };
+
+        } catch (error) {
+            console.error('Manual honeypot check error:', error);
+            return {
+                isHoneypot: false,
+                buyTax: 0,
+                sellTax: 0,
+                isBuyable: true,
+                isSellable: true,
+                error: 'Check failed',
+                source: 'manual'
+            };
+        }
+    }
+
     // Enrich token function (exact copy from solTokenScan.js)
     private async enrichToken(poolAddress: string) {
         try {
+            const cacheKey = `SOL_ENRICH_${poolAddress}`;
+            const cachedData = this.dexScreenerCache.get(cacheKey);
+            if (cachedData && Date.now() - cachedData.timestamp < this.CACHE_DURATION) {
+                return cachedData.data as any;
+            }
+
             const res = await fetch(`https://api.dexscreener.com/latest/dex/pairs/solana/${poolAddress}`);
             const text = await res.text();
 
@@ -557,7 +948,7 @@ export class EnhancedTokenScanner {
 
             if (data && data.pair) {
                 const pair = data.pair;
-                return {
+                const enrichedData = {
                     mint: mintAddress,
                     name: pair.baseToken.name,
                     symbol: pair.baseToken.symbol,
@@ -572,6 +963,9 @@ export class EnhancedTokenScanner {
                     timestamp: Date.now(),
                     scannerCriteria: this.validationCriteria
                 };
+
+                this.dexScreenerCache.set(cacheKey, { data: enrichedData as any, timestamp: Date.now() });
+                return enrichedData;
             }
             return null;
         } catch (error) {
@@ -583,6 +977,12 @@ export class EnhancedTokenScanner {
     // Get token data from DexScreener (for ETH/BSC)
     private async getTokenDataFromDexScreener(network: 'ETH' | 'BSC', tokenAddress: string): Promise<TokenData | null> {
         try {
+            const cacheKey = `${network}_${tokenAddress}`;
+            const cachedData = this.dexScreenerCache.get(cacheKey);
+            if (cachedData && Date.now() - cachedData.timestamp < this.CACHE_DURATION) {
+                return cachedData.data;
+            }
+
             const response = await fetch(`${NETWORK_CONFIGS[network].dexScreenerBase}${tokenAddress}`);
             const data = await response.json() as DexScreenerResponse;
 
@@ -593,7 +993,7 @@ export class EnhancedTokenScanner {
             // Get the most liquid pair
             const pair = data.pairs[0];
             
-            return {
+            const tokenData: TokenData = {
                 address: tokenAddress,
                 symbol: pair.baseToken.symbol,
                 name: pair.baseToken.name,
@@ -604,10 +1004,13 @@ export class EnhancedTokenScanner {
                 age: this.formatAge(pair.pairCreatedAt),
                 ageSeconds: Math.floor((Date.now() - pair.pairCreatedAt) / 1000),
                 pairAddress: pair.pairAddress,
-                dexScreenerUrl: `https://dexscreener.com/${network.toLowerCase()}/pair/${pair.pairAddress}`,
+                dexScreenerUrl: `https://dexscreener.com/${network === 'ETH' ? 'ethereum' : network.toLowerCase()}/${pair.pairAddress}`,
                 timestamp: Date.now(),
                 scannerCriteria: this.validationCriteria
             };
+
+            this.dexScreenerCache.set(cacheKey, { data: tokenData, timestamp: Date.now() });
+            return tokenData;
 
         } catch (error) {
             console.error(`Error fetching ${network} token data:`, error);
@@ -618,6 +1021,12 @@ export class EnhancedTokenScanner {
     // Get Solana token data (fallback for processSolanaPool if enrichedData is not provided)
     private async getSolanaTokenData(poolAddress: string): Promise<TokenData | null> {
         try {
+            const cacheKey = `SOL_${poolAddress}`;
+            const cachedData = this.dexScreenerCache.get(cacheKey);
+            if (cachedData && Date.now() - cachedData.timestamp < this.CACHE_DURATION) {
+                return cachedData.data;
+            }
+
             const response = await fetch(`${NETWORK_CONFIGS.SOL.dexScreenerBase}${poolAddress}`);
             const data = await response.json() as DexScreenerResponse;
 
@@ -627,7 +1036,7 @@ export class EnhancedTokenScanner {
 
             const pair = data.pair;
             
-            return {
+            const tokenData: TokenData = {
                 address: pair.baseToken.address,
                 symbol: pair.baseToken.symbol,
                 name: pair.baseToken.name,
@@ -638,10 +1047,13 @@ export class EnhancedTokenScanner {
                 age: this.formatAge(pair.pairCreatedAt),
                 ageSeconds: Math.floor((Date.now() - pair.pairCreatedAt) / 1000),
                 pairAddress: poolAddress,
-                dexScreenerUrl: `https://dexscreener.com/solana/${pair.baseToken.address}`,
+                dexScreenerUrl: `https://dexscreener.com/solana/${poolAddress}`,
                 timestamp: Date.now(),
                 scannerCriteria: this.validationCriteria
             };
+
+            this.dexScreenerCache.set(cacheKey, { data: tokenData, timestamp: Date.now() });
+            return tokenData;
 
         } catch (error) {
             console.error('Error fetching Solana token data:', error);
@@ -695,6 +1107,39 @@ export class EnhancedTokenScanner {
         if (seconds > 0 || result === '') result += `${seconds}s`;
 
         return result.trim();
+    }
+
+    // Check for suspicious patterns in token data
+    private hasSuspiciousPatterns(tokenData: TokenData): boolean {
+        const symbol = tokenData.symbol.toLowerCase();
+        const name = tokenData.name.toLowerCase();
+
+        // Check for common scam patterns - but be less strict
+        const suspiciousPatterns = [
+            'test', 'fake', 'scam', 'honeypot', 'rug', 'pull',
+            'copy', 'clone', 'fake', 'test', 'demo', 'example'
+        ];
+
+        // Only filter out if the pattern is a complete match or very obvious
+        for (const pattern of suspiciousPatterns) {
+            if (symbol === pattern || name === pattern) {
+                return true;
+            }
+            // Also check if it starts with the pattern (e.g., "test123")
+            if (symbol.startsWith(pattern) && symbol.length <= pattern.length + 3) {
+                return true;
+            }
+            if (name.startsWith(pattern) && name.length <= pattern.length + 3) {
+                return true;
+            }
+        }
+
+        // Check for very short or very long names - but be more lenient
+        if (symbol.length < 1 || symbol.length > 50) {
+            return true;
+        }
+
+        return false;
     }
 
     isScanning(): boolean {

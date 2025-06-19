@@ -10,6 +10,7 @@
     "lint": "eslint . --ext .ts"
   },
   "dependencies": {
+    "@goplus/sdk-node": "^1.1.1",
     "@jup-ag/api": "^6.0.42",
     "@metaplex-foundation/mpl-token-metadata": "^3.4.0",
     "@project-serum/anchor": "^0.26.0",

@@ -2,7 +2,7 @@ import { ethers, TransactionResponse } from 'ethers';
 import { Connection, PublicKey, Keypair } from '@solana/web3.js';
 import { NETWORK_CONFIGS } from '../lib/sniperBot';
 import { tokenScanner } from '../lib/tokenScanner';
-import { EnhancedTokenScanner, TokenData, TokenValidationCriteria } from '../lib/enhancedTokenScanner';
+import { EnhancedTokenScanner, TokenData, TokenValidationCriteria, HoneypotCheckResult } from '../lib/enhancedTokenScanner';
 
 // Paper Trading Configuration
 export interface PaperTradeConfig {
@@ -66,11 +66,15 @@ export class PaperTradeBot {
     // Initialize enhanced token scanner
     async initializeEnhancedTokenScanner() {
         try {
-            // Default validation criteria
+            // Default validation criteria - make them more lenient
             const defaultCriteria: TokenValidationCriteria = {
-                minLiquidity: 1000,
-                minVolume: 25,
-                requireDexScreener: true
+                minLiquidity: 100, // Lower from 1000 to 100
+                minVolume: 1, // Lower from 25 to 1
+                requireDexScreener: true,
+                enableHoneypotDetection: false, // Disable by default to avoid blocking tokens
+                excludeStablecoins: true,
+                minTokenAge: 30, // Only filter out tokens less than 30 seconds old
+                maxTokenAge: 604800 // Only filter out tokens older than 7 days
             };
 
             this.enhancedTokenScanner = new EnhancedTokenScanner(
@@ -89,10 +93,23 @@ export class PaperTradeBot {
     // Handle token detection from enhanced scanner
     private async handleTokenDetected(tokenData: TokenData) {
         try {
-            // Send token detection message to ALL users who have configurations
+            console.log(`🎯 PaperTradeBot received token detection: ${tokenData.symbol} on ${tokenData.network}`);
+            console.log(`📊 Token details:`, {
+                symbol: tokenData.symbol,
+                name: tokenData.name,
+                price: tokenData.price,
+                liquidity: tokenData.liquidity,
+                volume24h: tokenData.volume24h,
+                age: tokenData.age,
+                ageSeconds: tokenData.ageSeconds
+            });
+
+            // Send token detection message to ALL users who have configurations immediately
             for (const [userId, userConfig] of this.userConfigs) {
+                console.log(`📱 Processing paper trade for user ${userId}`);
+                
                 await this.botConfig.onLog(
-                    `🔎 Token detected! Checking for paper trade...\n\n` +
+                    `📊 Paper Trade Alert!\n\n` +
                     `🪙 ${tokenData.symbol} (${tokenData.name})\n` +
                     `🌐 Network: ${tokenData.network}\n` +
                     `💰 Price: $${tokenData.price.toFixed(8)}\n` +
@@ -106,6 +123,8 @@ export class PaperTradeBot {
 
                 // Perform validation here using the scanner's criteria (or user's if set)
                 const userCriteria = this.userValidationCriteria.get(userId) || tokenData.scannerCriteria; // Use scanner's criteria as fallback
+                
+                console.log(`🔍 Paper trade validation criteria for user ${userId}:`, userCriteria);
                 
                 let validationMessage = '✅ Token passed all criteria!';
                 let isValid = true;
@@ -124,19 +143,126 @@ export class PaperTradeBot {
                     validationMessage = `❌ Failed: DexScreener data required but not available or price is zero.`;
                 }
 
-                await this.botConfig.onLog(`🔍 Paper Trading Validation: ${validationMessage}`, userId);
+                console.log(`🔍 Paper trade validation result for user ${userId}: ${validationMessage}`);
+                await this.botConfig.onLog(`🔍 Paper Trade Validation: ${validationMessage}`, userId);
 
-                // Only attempt to paper trade if user has a wallet for this network AND token is valid
+                // Only attempt to paper trade if user has a paper wallet for this network AND token is valid
                 if (isValid && this.hasUserWallet(userId, tokenData.network)) {
+                    console.log(`🚀 Attempting paper trade for ${tokenData.symbol} for user ${userId}`);
                     await this.attemptPaperTrade(userId, tokenData);
                 } else if (!this.hasUserWallet(userId, tokenData.network)) {
+                    console.log(`⚠️ User ${userId} has no ${tokenData.network} paper wallet configured`);
                     await this.botConfig.onLog(`⚠️ No ${tokenData.network} paper wallet configured. Cannot paper trade this token.`, userId);
                 } else {
+                    console.log(`➡️ Not paper trading ${tokenData.symbol} for user ${userId} - validation failed`);
                     await this.botConfig.onLog('➡️ Not paper trading this token.', userId);
                 }
             }
         } catch (error) {
-            console.error('Error handling token detection in paper trading:', error);
+            console.error('Error handling token detection in PaperTradeBot:', error);
+        }
+    }
+
+    // Send initial token detection message (fast, non-blocking)
+    private async sendInitialTokenMessage(userId: number, tokenData: TokenData) {
+        try {
+            await this.botConfig.onLog(
+                `🔎 **New Token Detected!**\n\n` +
+                `🪙 **${tokenData.symbol}** (${tokenData.name})\n` +
+                `🌐 Network: ${tokenData.network}\n` +
+                `💰 Price: $${tokenData.price.toFixed(8)}\n` +
+                `💧 Liquidity: $${tokenData.liquidity.toLocaleString()}\n` +
+                `📊 24h Volume: $${tokenData.volume24h.toLocaleString()}\n` +
+                `⏰ Age: ${tokenData.age}\n` +
+                `📍 Address: \`${tokenData.address}\`\n` +
+                `🔗 [DexScreener](${tokenData.dexScreenerUrl})\n\n` +
+                `🔍 **Validating token...**`,
+                userId
+            );
+        } catch (error) {
+            console.error('Error sending initial token message:', error);
+        }
+    }
+
+    // Perform validation and trading in parallel (non-blocking)
+    private async performValidationAndTrading(userId: number, tokenData: TokenData, userConfig: PaperTradeConfig) {
+        try {
+            // Perform validation here using the scanner's criteria (or user's if set)
+            const userCriteria = this.userValidationCriteria.get(userId) || tokenData.scannerCriteria;
+            
+            let validationMessage = '✅ Token passed all criteria!';
+            let isValid = true;
+
+            // Quick validation checks (fast)
+            if (tokenData.liquidity < userCriteria.minLiquidity) {
+                isValid = false;
+                validationMessage = `❌ Failed: Liquidity ($${tokenData.liquidity.toLocaleString()}) below minimum ($${userCriteria.minLiquidity.toLocaleString()})`;
+            } else if (tokenData.volume24h < userCriteria.minVolume) {
+                isValid = false;
+                validationMessage = `❌ Failed: 24h Volume ($${tokenData.volume24h.toLocaleString()}) below minimum ($${userCriteria.minVolume.toLocaleString()})`;
+            } else if (userCriteria.maxAge && tokenData.ageSeconds > userCriteria.maxAge) {
+                isValid = false;
+                validationMessage = `❌ Failed: Age (${tokenData.age}) above maximum (${userCriteria.maxAge}s)`;
+            } else if (userCriteria.requireDexScreener && (!tokenData.price || tokenData.price === 0)) {
+                isValid = false;
+                validationMessage = `❌ Failed: DexScreener data required but not available or price is zero.`;
+            }
+
+            // Send validation result immediately
+            await this.botConfig.onLog(`🔍 Paper Trading Validation: ${validationMessage}`, userId);
+
+            // Check honeypot status if enabled (non-blocking)
+            if (userCriteria.enableHoneypotDetection && tokenData.honeypotCheck) {
+                if (tokenData.honeypotCheck.isHoneypot) {
+                    isValid = false;
+                    await this.botConfig.onLog(`🚨 HONEYPOT DETECTED: Token is not safe to trade!`, userId);
+                } else {
+                    // Send honeypot status message
+                    await this.sendHoneypotStatus(userId, tokenData.honeypotCheck);
+                }
+            }
+
+            // Only attempt to paper trade if user has a wallet for this network AND token is valid
+            if (isValid && this.hasUserWallet(userId, tokenData.network)) {
+                await this.attemptPaperTrade(userId, tokenData);
+            } else if (!this.hasUserWallet(userId, tokenData.network)) {
+                await this.botConfig.onLog(`⚠️ No ${tokenData.network} paper wallet configured. Cannot paper trade this token.`, userId);
+            } else {
+                await this.botConfig.onLog('➡️ Not paper trading this token.', userId);
+            }
+
+        } catch (error) {
+            console.error('Error in validation and trading:', error);
+            await this.botConfig.onError(error as Error, userId);
+        }
+    }
+
+    // Send honeypot status message
+    private async sendHoneypotStatus(userId: number, honeypotCheck: HoneypotCheckResult) {
+        try {
+            if (honeypotCheck.isHoneypot) {
+                await this.botConfig.onLog(
+                    `🚨 **HONEYPOT DETECTED!**\n` +
+                    `❌ Buy Tax: ${honeypotCheck.buyTax}%\n` +
+                    `❌ Sell Tax: ${honeypotCheck.sellTax}%\n` +
+                    `❌ Buyable: ${honeypotCheck.isBuyable ? 'Yes' : 'No'}\n` +
+                    `❌ Sellable: ${honeypotCheck.isSellable ? 'No' : 'Yes'}\n` +
+                    `⚠️ Source: ${honeypotCheck.source}`,
+                    userId
+                );
+            } else {
+                await this.botConfig.onLog(
+                    `✅ **SAFE TOKEN**\n` +
+                    `✅ Buy Tax: ${honeypotCheck.buyTax}%\n` +
+                    `✅ Sell Tax: ${honeypotCheck.sellTax}%\n` +
+                    `✅ Buyable: ${honeypotCheck.isBuyable ? 'Yes' : 'No'}\n` +
+                    `✅ Sellable: ${honeypotCheck.isSellable ? 'Yes' : 'No'}\n` +
+                    `🔍 Source: ${honeypotCheck.source}`,
+                    userId
+                );
+            }
+        } catch (error) {
+            console.error('Error sending honeypot status:', error);
         }
     }
 
@@ -160,6 +286,55 @@ export class PaperTradeBot {
         return this.userValidationCriteria.get(userId);
     }
 
+    // Set user honeypot detection preferences
+    setUserHoneypotDetection(userId: number, enabled: boolean) {
+        const currentCriteria = this.userValidationCriteria.get(userId) || {
+            minLiquidity: 1000,
+            minVolume: 25,
+            requireDexScreener: true,
+            enableHoneypotDetection: true,
+            excludeStablecoins: true,
+            minTokenAge: 60,
+            maxTokenAge: 86400
+        };
+        
+        currentCriteria.enableHoneypotDetection = enabled;
+        this.setUserValidationCriteria(userId, currentCriteria);
+    }
+
+    // Set user stablecoin filtering preferences
+    setUserStablecoinFiltering(userId: number, enabled: boolean) {
+        const currentCriteria = this.userValidationCriteria.get(userId) || {
+            minLiquidity: 1000,
+            minVolume: 25,
+            requireDexScreener: true,
+            enableHoneypotDetection: true,
+            excludeStablecoins: true,
+            minTokenAge: 60,
+            maxTokenAge: 86400
+        };
+        
+        currentCriteria.excludeStablecoins = enabled;
+        this.setUserValidationCriteria(userId, currentCriteria);
+    }
+
+    // Set user token age preferences
+    setUserTokenAgePreferences(userId: number, minAge: number, maxAge: number) {
+        const currentCriteria = this.userValidationCriteria.get(userId) || {
+            minLiquidity: 1000,
+            minVolume: 25,
+            requireDexScreener: true,
+            enableHoneypotDetection: true,
+            excludeStablecoins: true,
+            minTokenAge: 60,
+            maxTokenAge: 86400
+        };
+        
+        currentCriteria.minTokenAge = minAge;
+        currentCriteria.maxTokenAge = maxAge;
+        this.setUserValidationCriteria(userId, currentCriteria);
+    }
+
     // Get user's paper traded tokens
     getUserPaperTradedTokens(userId: number): TokenData[] {
         return this.paperTradedTokens.get(userId) || [];
@@ -168,20 +343,25 @@ export class PaperTradeBot {
     // Attempt to paper trade a detected token
     private async attemptPaperTrade(userId: number, tokenData: TokenData) {
         try {
+            console.log(`🚀 Starting paper trade attempt for ${tokenData.symbol} (${tokenData.address}) on ${tokenData.network} for user ${userId}`);
+            
             const userConfig = this.getUserConfig(userId);
             if (!userConfig) {
-                console.log(`No config found for user ${userId} in paper trading`);
+                console.log(`❌ No config found for user ${userId} in paper trading`);
                 return;
             }
 
             const wallet = this.getUserWallet(userId, tokenData.network);
             if (!wallet) {
-                console.log(`No ${tokenData.network} wallet found for user ${userId} in paper trading`);
+                console.log(`❌ No ${tokenData.network} wallet found for user ${userId} in paper trading`);
                 return;
             }
 
+            console.log(`💰 User ${userId} paper wallet balance: ${wallet.balance} ${tokenData.network}, required: ${userConfig.amount}`);
+
             // Check if we have enough balance (for real trading simulation)
             if (wallet.balance < userConfig.amount) {
+                console.log(`⚠️ Insufficient paper balance for user ${userId}: ${wallet.balance} < ${userConfig.amount}`);
                 await this.botConfig.onLog(
                     `⚠️ Paper Trading: Insufficient ${tokenData.network} balance (You only have ${wallet.balance.toFixed(4)} ${tokenData.network === 'ETH' ? 'ETH' : tokenData.network === 'BSC' ? 'BNB' : 'SOL'}, but tried to invest ${userConfig.amount}). Simulating trade anyway.`,
                     userId
@@ -189,11 +369,21 @@ export class PaperTradeBot {
                 // Do not return here, continue with simulation
             }
 
-            // Simulate paper trading
-            const entryPrice = tokenData.price;
+            console.log(`✅ Proceeding with paper trade simulation...`);
+
+            // Fetch real price from DexScreener instead of using random price
+            const realPrice = await this.getCurrentTokenPrice(tokenData.address, tokenData.network);
+            if (!realPrice) {
+                await this.botConfig.onLog(`❌ Could not fetch real price for ${tokenData.symbol} on ${tokenData.network}. Skipping paper trade.`, userId);
+                return;
+            }
+            const entryPrice = realPrice;
+            
             // Calculate token amount based on userConfig.amount, but cap it if paper balance is too low for simulation
             const amountToUse = Math.min(userConfig.amount, wallet.balance);
             const tokenAmount = amountToUse / entryPrice;
+            
+            console.log(`📊 Paper trade calculation: Amount to use: ${amountToUse}, Token amount: ${tokenAmount}, Entry price: $${entryPrice}`);
             
             // Deduct from wallet balance (only the amount actually used in simulation)
             wallet.balance -= amountToUse;
@@ -215,6 +405,8 @@ export class PaperTradeBot {
 
             wallet.tokens.set(tokenData.address, position);
 
+            console.log(`📊 Paper position created for ${tokenData.symbol}: Entry Price: $${entryPrice}, Stop Loss: ${userConfig.stopLoss}%, Take Profit: ${userConfig.takeProfit}%`);
+
             // Store paper traded token
             if (!this.paperTradedTokens.has(userId)) {
                 this.paperTradedTokens.set(userId, []);
@@ -222,18 +414,22 @@ export class PaperTradeBot {
             this.paperTradedTokens.get(userId)!.push(tokenData);
 
             await this.botConfig.onLog(
-                `✅ Paper Trading: Successfully Sniped ${tokenData.symbol}!\n\n` +
-                `💰 Amount: ${userConfig.amount} ${tokenData.network === 'ETH' ? 'ETH' : tokenData.network === 'BSC' ? 'BNB' : 'SOL'}\n` +
+                `📊 Paper Trade Executed!\n\n` +
+                `🪙 ${tokenData.symbol} (${tokenData.name})\n` +
+                `💰 Amount: ${amountToUse.toFixed(4)} ${tokenData.network === 'ETH' ? 'ETH' : tokenData.network === 'BSC' ? 'BNB' : 'SOL'}\n` +
                 `📈 Entry Price: $${entryPrice.toFixed(8)}\n` +
                 `🪙 Tokens: ${tokenAmount.toFixed(2)}\n` +
                 `📊 Stop Loss: ${userConfig.stopLoss}%\n` +
                 `🎯 Take Profit: ${userConfig.takeProfit}%\n` +
-                `⏰ Entry Time: ${new Date().toLocaleString()}`,
+                `📍 Address: \`${tokenData.address}\`\n` +
+                `🔗 [DexScreener](${tokenData.dexScreenerUrl})`,
                 userId
             );
 
+            console.log(`🎉 PAPER TRADE SUCCESSFULLY EXECUTED! ${tokenData.symbol} has been paper traded and position is being monitored.`);
+
         } catch (error) {
-            console.error(`Error paper trading token for user ${userId}:`, error);
+            console.error(`❌ Error paper trading token ${tokenData.symbol} for user ${userId}:`, error);
             await this.botConfig.onError(error as Error, userId);
         }
     }
@@ -380,6 +576,22 @@ export class PaperTradeBot {
         }
     }
 
+    // Show updated paper trading balances for all active wallets
+    async showPaperTradingBalances(userId: number) {
+        const networks = ['ETH', 'BSC', 'SOL'] as const;
+        let message = '💰 Paper Trading Balances:\n\n';
+        let hasWallet = false;
+        for (const network of networks) {
+            const wallet = this.getUserWallet(userId, network);
+            if (wallet && (wallet as any).isActive !== false) {
+                message += `${network === 'ETH' ? '🔷' : network === 'BSC' ? '🟡' : '🟣'} ${network}: ${wallet.balance.toFixed(4)} ${network === 'ETH' ? 'ETH' : network === 'BSC' ? 'BNB' : 'SOL'}\n`;
+                hasWallet = true;
+            }
+        }
+        if (!hasWallet) message += 'No active paper wallets found.';
+        await this.botConfig.onLog(message, userId);
+    }
+
     // Start paper trading monitoring
     async startPaperTrading(userId: number) {
         if (this.isRunning) {
@@ -406,11 +618,17 @@ export class PaperTradeBot {
             await this.initializeEnhancedTokenScanner();
         }
 
-        // Determine which networks to scan based on user's wallets
+        // Determine which networks to scan based on user's wallets and activation status
         const networksToScan: ('ETH' | 'BSC' | 'SOL')[] = [];
-        if (hasEthWallet) networksToScan.push('ETH');
-        if (hasBscWallet) networksToScan.push('BSC');
-        if (hasSolWallet) networksToScan.push('SOL');
+        const ethWallet = this.getUserWallet(userId, 'ETH');
+        const bscWallet = this.getUserWallet(userId, 'BSC');
+        const solWallet = this.getUserWallet(userId, 'SOL');
+        const ethActive = ethWallet && (ethWallet as any).isActive !== false;
+        const bscActive = bscWallet && (bscWallet as any).isActive !== false;
+        const solActive = solWallet && (solWallet as any).isActive !== false;
+        if (ethActive) networksToScan.push('ETH');
+        if (bscActive) networksToScan.push('BSC');
+        if (solActive) networksToScan.push('SOL');
 
         // Start enhanced token scanner only for networks with active wallets
         if (this.enhancedTokenScanner && !this.enhancedTokenScanner.isScanning()) {
@@ -423,15 +641,19 @@ export class PaperTradeBot {
         // Set default validation criteria for user if not set
         if (!this.userValidationCriteria.has(userId)) {
             this.setUserValidationCriteria(userId, {
-                minLiquidity: 1000,
-                minVolume: 25,
-                requireDexScreener: true
+                minLiquidity: 100, // Lower from 1000 to 100
+                minVolume: 1, // Lower from 25 to 1
+                requireDexScreener: true,
+                enableHoneypotDetection: false, // Disable by default
+                excludeStablecoins: true,
+                minTokenAge: 30, // Only filter out tokens less than 30 seconds old
+                maxTokenAge: 604800 // Only filter out tokens older than 7 days
             });
         }
 
         await this.botConfig.onLog('🔍 Enhanced Token Scanner is now monitoring for new tokens with validation criteria:\n' +
-            `💧 Min Liquidity: $${this.userValidationCriteria.get(userId)?.minLiquidity || 1000}\n` +
-            `📊 Min Volume: $${this.userValidationCriteria.get(userId)?.minVolume || 25}\n` +
+            `💧 Min Liquidity: $${this.userValidationCriteria.get(userId)?.minLiquidity || 100}\n` +
+            `📊 Min Volume: $${this.userValidationCriteria.get(userId)?.minVolume || 1}\n` +
             `✅ DexScreener Required: ${this.userValidationCriteria.get(userId)?.requireDexScreener || true}`, userId);
 
         // Start price monitoring for active positions
@@ -450,9 +672,9 @@ export class PaperTradeBot {
 
         await this.botConfig.onLog('✅ Paper Trading Bot is now running!\n\n' +
             '📊 Status:\n' +
-            `🔷 ETH: ${hasEthWallet ? '✅' : '❌'}\n` +
-            `🟡 BSC: ${hasBscWallet ? '✅' : '❌'}\n` +
-            `🟣 SOL: ${hasSolWallet ? '✅' : '❌'}\n\n` +
+            `🔷 ETH: ${ethActive ? '✅' : '❌'}\n` +
+            `🟡 BSC: ${bscActive ? '✅' : '❌'}\n` +
+            `🟣 SOL: ${solActive ? '✅' : '❌'}\n\n` +
             `📡 Scanning networks: ${networksToScan.join(', ')}\n\n` +
             'The bot will simulate sniping real tokens with dummy coins.', userId);
     }
@@ -535,8 +757,13 @@ export class PaperTradeBot {
                 return;
             }
 
-            // Simulate entry price (random price between 0.0001 and 0.01)
-            const entryPrice = Math.random() * 0.0099 + 0.0001;
+            // Fetch real price from DexScreener instead of using random price
+            const realPrice = await this.getCurrentTokenPrice(tokenAddress, network);
+            if (!realPrice) {
+                await this.botConfig.onLog(`❌ Could not fetch real price for ${tokenSymbol} on ${network}. Skipping paper trade.`, userId);
+                return;
+            }
+            const entryPrice = realPrice;
             
             // Calculate token amount based on config amount
             const tokenAmount = config.amount / entryPrice;
@@ -638,7 +865,9 @@ export class PaperTradeBot {
                 `📊 Reason: ${reasonText}\n` +
                 `💰 Profit/Loss: ${profitLoss >= 0 ? '+' : ''}${profitLoss.toFixed(4)} ${network === 'ETH' ? 'ETH' : network === 'BSC' ? 'BNB' : 'SOL'}\n` +
                 `📈 Percentage: ${profitLossPercent >= 0 ? '+' : ''}${profitLossPercent.toFixed(2)}%\n` +
-                `🎯 Entry: $${position.entryPrice.toFixed(6)} → Exit: $${position.currentPrice.toFixed(6)}`, userId);
+                `🎯 Entry: $${position.entryPrice.toFixed(6)} → Exit: $${position.currentPrice.toFixed(6)}\n` +
+                `💼 New Balance: ${wallet.balance.toFixed(4)} ${network === 'ETH' ? 'ETH' : network === 'BSC' ? 'BNB' : 'SOL'}`,
+                userId);
 
         } catch (error) {
             console.error('Error simulating sell:', error);
@@ -779,12 +1008,14 @@ export class PaperTradeBot {
             const positionKey = `${userId}_${network}_${tokenAddress}`;
             const lastLoggedChange = this.lastPriceLogs.get(positionKey) || 0;
             if (Math.abs(priceChange - lastLoggedChange) >= 5) {
+                const balance = wallet ? wallet.balance.toFixed(4) : 'N/A';
                 await this.botConfig.onLog(
                     `📊 Paper Trading: ${position.tokenSymbol} Price Update:\n` +
                     `💰 Current Price: $${currentPrice.toFixed(8)}\n` +
                     `📈 Entry Price: $${position.entryPrice.toFixed(8)}\n` +
                     `📊 Change: ${priceChange > 0 ? '+' : ''}${priceChange.toFixed(2)}%\n` +
-                    `🎯 TP: ${position.takeProfit}% | 🛑 SL: ${position.stopLoss}%`,
+                    `🎯 TP: ${position.takeProfit}% | 🛑 SL: ${position.stopLoss}%\n` +
+                    `💼 Balance: ${balance} ${network === 'ETH' ? 'ETH' : network === 'BSC' ? 'BNB' : 'SOL'}`,
                     userId
                 );
                 this.lastPriceLogs.set(positionKey, priceChange);
@@ -810,9 +1041,9 @@ export class PaperTradeBot {
             const profitLoss = priceChange;
             const profitLossUSD = (position.amount * profitLoss) / 100;
 
-            // Add back to wallet balance (simulated)
-            const sellValue = position.amount * (1 + profitLoss / 100);
-            wallet.balance += sellValue;
+            // Add back to wallet balance
+            const sellAmount = position.amount * position.currentPrice;
+            wallet.balance += sellAmount;
 
             const emoji = reason === 'TAKE_PROFIT' ? '🎯' : '🛑';
             const reasonText = reason === 'TAKE_PROFIT' ? 'Take Profit Reached!' : 'Stop Loss Triggered!';
@@ -820,7 +1051,7 @@ export class PaperTradeBot {
             await this.botConfig.onLog(
                 `${emoji} Paper Trading: ${reasonText}\n\n` +
                 `🪙 Token: ${position.tokenSymbol}\n` +
-                `💰 Invested: ${position.amount.toFixed(4)} ${network === 'ETH' ? 'ETH' : network === 'BSC' ? 'BNB' : 'SOL'}\n` +
+                `💰 Invested: $${(position.amount * position.entryPrice).toFixed(2)} (${position.amount.toFixed(4)} ${network === 'ETH' ? 'ETH' : network === 'BSC' ? 'BNB' : 'SOL'})\n` +
                 `📈 Entry Price: $${position.entryPrice.toFixed(8)}\n` +
                 `📊 Exit Price: $${position.currentPrice.toFixed(8)}\n` +
                 `📊 P&L: ${profitLoss > 0 ? '+' : ''}${profitLoss.toFixed(2)}% (${profitLossUSD > 0 ? '+' : ''}$${profitLossUSD.toFixed(2)})\n` +
@@ -857,5 +1088,12 @@ export class PaperTradeBot {
             console.error(`Error fetching price for ${tokenAddress}:`, error);
             return null;
         }
+    }
+
+    // Activate or deactivate a paper wallet for a user and network
+    setPaperWalletActive(userId: number, network: 'ETH' | 'BSC' | 'SOL', active: boolean) {
+        const wallet = this.getUserWallet(userId, network);
+        if (!wallet) return;
+        (wallet as any).isActive = active;
     }
 }

@@ -104,11 +104,15 @@ export class SniperBot {
     // Initialize enhanced token scanner
     async initializeEnhancedTokenScanner() {
         try {
-            // Default validation criteria
+            // Default validation criteria - make them more lenient
             const defaultCriteria: TokenValidationCriteria = {
-                minLiquidity: 1000,
-                minVolume: 25,
-                requireDexScreener: true
+                minLiquidity: 100, // Lower from 1000 to 100
+                minVolume: 1, // Lower from 25 to 1
+                requireDexScreener: true,
+                enableHoneypotDetection: false, // Disable by default to avoid blocking tokens
+                excludeStablecoins: true,
+                minTokenAge: 30, // Only filter out tokens less than 30 seconds old
+                maxTokenAge: 604800 // Only filter out tokens older than 7 days
             };
 
             this.enhancedTokenScanner = new EnhancedTokenScanner(
@@ -127,8 +131,21 @@ export class SniperBot {
     // Handle token detection from enhanced scanner
     private async handleTokenDetected(tokenData: TokenData) {
         try {
+            console.log(`🎯 SniperBot received token detection: ${tokenData.symbol} on ${tokenData.network}`);
+            console.log(`📊 Token details:`, {
+                symbol: tokenData.symbol,
+                name: tokenData.name,
+                price: tokenData.price,
+                liquidity: tokenData.liquidity,
+                volume24h: tokenData.volume24h,
+                age: tokenData.age,
+                ageSeconds: tokenData.ageSeconds
+            });
+
             // Send token detection message to ALL users who have configurations
             for (const [userId, userConfig] of this.userConfigs) {
+                console.log(`📱 Processing token for user ${userId}`);
+                
                 await this.botConfig.onLog(
                     `🔎 Token detected! Checking for snipe...\n\n` +
                     `🪙 ${tokenData.symbol} (${tokenData.name})\n` +
@@ -144,6 +161,8 @@ export class SniperBot {
 
                 // Perform validation here using the scanner's criteria (or user's if set)
                 const userCriteria = this.userValidationCriteria.get(userId) || tokenData.scannerCriteria; // Use scanner's criteria as fallback
+                
+                console.log(`🔍 Validation criteria for user ${userId}:`, userCriteria);
                 
                 let validationMessage = '✅ Token passed all criteria!';
                 let isValid = true;
@@ -162,14 +181,18 @@ export class SniperBot {
                     validationMessage = `❌ Failed: DexScreener data required but not available or price is zero.`;
                 }
 
+                console.log(`🔍 Validation result for user ${userId}: ${validationMessage}`);
                 await this.botConfig.onLog(`🔍 Sniper Bot Validation: ${validationMessage}`, userId);
 
                 // Only attempt to snipe if user has a wallet for this network AND token is valid
                 if (isValid && this.hasUserWallet(userId, tokenData.network)) {
+                    console.log(`🚀 Attempting to snipe ${tokenData.symbol} for user ${userId}`);
                     await this.attemptSnipe(userId, tokenData);
                 } else if (!this.hasUserWallet(userId, tokenData.network)) {
+                    console.log(`⚠️ User ${userId} has no ${tokenData.network} wallet configured`);
                     await this.botConfig.onLog(`⚠️ No ${tokenData.network} wallet configured. Cannot snipe this token.`, userId);
                 } else {
+                    console.log(`➡️ Not sniping ${tokenData.symbol} for user ${userId} - validation failed`);
                     await this.botConfig.onLog('➡️ Not sniping this token.', userId);
                 }
             }
@@ -206,15 +229,17 @@ export class SniperBot {
     // Attempt to snipe a detected token
     private async attemptSnipe(userId: number, tokenData: TokenData) {
         try {
+            console.log(`🚀 Starting snipe attempt for ${tokenData.symbol} (${tokenData.address}) on ${tokenData.network} for user ${userId}`);
+            
             const userConfig = this.getUserConfig(userId);
             if (!userConfig) {
-                console.log(`No config found for user ${userId}`);
+                console.log(`❌ No config found for user ${userId}`);
                 return;
             }
 
             const wallet = this.getUserWallet(userId, tokenData.network);
             if (!wallet) {
-                console.log(`No ${tokenData.network} wallet found for user ${userId}`);
+                console.log(`❌ No ${tokenData.network} wallet found for user ${userId}`);
                 return;
             }
 
@@ -222,7 +247,10 @@ export class SniperBot {
             const balance = await this.getWalletBalance(userId, tokenData.network);
             const balanceNum = parseFloat(balance.split(' ')[0]);
             
+            console.log(`💰 User ${userId} balance: ${balance} ${tokenData.network}, required: ${userConfig.amount}`);
+            
             if (balanceNum < userConfig.amount) {
+                console.log(`❌ Insufficient balance for user ${userId}: ${balanceNum} < ${userConfig.amount}`);
                 await this.botConfig.onLog(
                     `⚠️ Insufficient ${tokenData.network} balance for sniping ${tokenData.symbol}`,
                     userId
@@ -230,14 +258,20 @@ export class SniperBot {
                 return;
             }
 
+            console.log(`✅ Sufficient balance confirmed. Executing snipe...`);
+
             // Attempt to snipe based on network
             let txHash: string | TransactionResponse;
             
             if (tokenData.network === 'SOL') {
+                console.log(`🔗 Executing Solana snipe for ${tokenData.symbol}`);
                 txHash = await this.executeSolSnipe(wallet, tokenData.address, userConfig.amount, userConfig.slippage);
             } else {
+                console.log(`🔗 Executing EVM snipe for ${tokenData.symbol} on ${tokenData.network}`);
                 txHash = await this.snipeEvmToken(userId, tokenData.network, tokenData.address, userConfig.amount, userConfig.slippage);
             }
+
+            console.log(`✅ Snipe transaction successful for ${tokenData.symbol}! Transaction: ${typeof txHash === 'string' ? txHash : txHash.hash}`);
 
             // Store sniped token
             if (!this.snipedTokens.has(userId)) {
@@ -261,6 +295,8 @@ export class SniperBot {
 
             this.positions.set(`${userId}_${tokenData.address}`, position);
 
+            console.log(`📊 Position created for ${tokenData.symbol}: Entry Price: $${tokenData.price}, Stop Loss: ${userConfig.stopLoss}%, Take Profit: ${userConfig.takeProfit}%`);
+
             await this.botConfig.onLog(
                 `✅ Successfully Sniped ${tokenData.symbol}!\n\n` +
                 `💰 Amount: ${userConfig.amount} ${tokenData.network === 'ETH' ? 'ETH' : tokenData.network === 'BSC' ? 'BNB' : 'SOL'}\n` +
@@ -271,8 +307,10 @@ export class SniperBot {
                 userId
             );
 
+            console.log(`🎉 TOKEN SUCCESSFULLY BOUGHT! ${tokenData.symbol} has been sniped and position is being monitored.`);
+
         } catch (error) {
-            console.error(`Error sniping token for user ${userId}:`, error);
+            console.error(`❌ Error sniping token ${tokenData.symbol} for user ${userId}:`, error);
             await this.botConfig.onError(error as Error, userId);
         }
     }
@@ -552,15 +590,19 @@ export class SniperBot {
         // Set default validation criteria for user if not set
         if (!this.userValidationCriteria.has(userId)) {
             this.setUserValidationCriteria(userId, {
-                minLiquidity: 1000,
-                minVolume: 25,
-                requireDexScreener: true
+                minLiquidity: 100, // Lower from 1000 to 100
+                minVolume: 1, // Lower from 25 to 1
+                requireDexScreener: true,
+                enableHoneypotDetection: false, // Disable by default
+                excludeStablecoins: true,
+                minTokenAge: 30, // Only filter out tokens less than 30 seconds old
+                maxTokenAge: 604800 // Only filter out tokens older than 7 days
             });
         }
 
         this.botConfig.onLog('🔍 Enhanced Token Scanner is now monitoring for new tokens with validation criteria:\n' +
-            `💧 Min Liquidity: $${this.userValidationCriteria.get(userId)?.minLiquidity || 1000}\n` +
-            `📊 Min Volume: $${this.userValidationCriteria.get(userId)?.minVolume || 25}\n` +
+            `💧 Min Liquidity: $${this.userValidationCriteria.get(userId)?.minLiquidity || 100}\n` +
+            `📊 Min Volume: $${this.userValidationCriteria.get(userId)?.minVolume || 1}\n` +
             `✅ DexScreener Required: ${this.userValidationCriteria.get(userId)?.requireDexScreener || true}\n\n` +
             `📡 Scanning networks: ${networksToScan.join(', ')}`, userId);
 

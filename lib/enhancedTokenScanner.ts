@@ -638,11 +638,7 @@ export class EnhancedTokenScanner {
                 };
                 console.log(`📊 Using enriched data for ${tokenData.symbol}`);
             } else {
-                // Fallback to DexScreener API - add delay before fetching
-                console.log(`⏳ Waiting 0.1 seconds for DexScreener to index Solana pool: ${poolAddress}...`);
-                await new Promise(resolve => setTimeout(resolve, 100));
-                console.log(`✅ Delay completed, now fetching data from DexScreener for pool: ${poolAddress}`);
-                
+                // Fallback to DexScreener API - remove delay for instant alert
                 console.log(`📊 Fetching data from DexScreener for pool: ${poolAddress}`);
                 tokenData = await this.getSolanaTokenData(poolAddress);
             }
@@ -652,60 +648,23 @@ export class EnhancedTokenScanner {
                 return;
             }
 
-            console.log(`📊 Token data received for ${tokenData.symbol}:`, {
-                symbol: tokenData.symbol,
-                name: tokenData.name,
-                price: tokenData.price,
-                liquidity: tokenData.liquidity,
-                volume24h: tokenData.volume24h,
-                age: tokenData.age,
-                ageSeconds: tokenData.ageSeconds
-            });
+            // Only require a valid mint address (non-empty string)
+            if (!tokenData.address || typeof tokenData.address !== 'string' || tokenData.address.length < 32) {
+                console.log(`❌ Invalid mint address for SOL token: ${tokenData.address}`);
+                return;
+            }
 
-            // Check if token was already processed
+            // Skip all other validation for Solana tokens, send immediately
             const tokenKey = `SOL_${tokenData.address}`;
             if (this.processedTokens.has(tokenKey)) {
                 console.log(`⏭️ Token ${tokenData.address} already processed, skipping`);
                 return;
             }
-
-            // Mark as processed immediately
             this.processedTokens.add(tokenKey);
 
-            // Quick validation checks (non-blocking)
-            const quickValidation = this.quickTokenValidation(tokenData);
-            if (!quickValidation.isValid) {
-                console.log(`❌ Solana token ${tokenData.symbol} filtered out: ${quickValidation.reason}`);
-                return;
-            }
-
-            console.log(`✅ Quick validation passed for ${tokenData.symbol}`);
-
-            // Enhanced filtering (async but fast)
-            if (!await this.isValidNewToken(tokenData)) {
-                console.log(`❌ Solana token ${tokenData.symbol} filtered out: Not a valid new token`);
-                return;
-            }
-
-            console.log(`✅ Enhanced validation passed for ${tokenData.symbol}`);
-
-            // Validate token
-            if (await this.validateToken(tokenData)) {
-                const enrichedToken: TokenData = {
-                    ...tokenData,
-                    network: 'SOL',
-                    pairAddress: poolAddress,
-                    timestamp: Date.now(),
-                    scannerCriteria: this.validationCriteria
-                };
-
-                console.log('🎯 Valid new Solana token detected:', tokenData.symbol);
-                console.log(`Calling onTokenDetected for SOL with token: ${tokenData.symbol} and address: ${tokenData.address}`);
-                this.onTokenDetected(enrichedToken);
-            } else {
-                console.log(`❌ Final validation failed for ${tokenData.symbol}`);
-            }
-
+            console.log('🎯 Valid new Solana token detected:', tokenData.symbol);
+            console.log(`Calling onTokenDetected for SOL with token: ${tokenData.symbol} and address: ${tokenData.address}`);
+            this.onTokenDetected(tokenData);
         } catch (error) {
             console.error('Error processing Solana pool:', error);
         }
@@ -752,11 +711,12 @@ export class EnhancedTokenScanner {
     // Enhanced token validation to filter out stablecoins and established tokens
     private async isValidNewToken(tokenData: TokenData): Promise<boolean> {
         try {
-            // Check token age (avoid very new tokens and very old tokens)
-            // But be more lenient - only filter out extremely new tokens (< 30 seconds)
-            if (this.validationCriteria.minTokenAge && tokenData.ageSeconds < this.validationCriteria.minTokenAge) {
-                console.log(`❌ Token ${tokenData.symbol} too new: ${tokenData.ageSeconds}s < ${this.validationCriteria.minTokenAge}s`);
-                return false;
+            // Remove the minimum age filter for Solana tokens
+            if (tokenData.network !== 'SOL') {
+                if (this.validationCriteria.minTokenAge && tokenData.ageSeconds < this.validationCriteria.minTokenAge) {
+                    console.log(`❌ Token ${tokenData.symbol} too new: ${tokenData.ageSeconds}s < ${this.validationCriteria.minTokenAge}s`);
+                    return false;
+                }
             }
 
             // Be more lenient with max age - only filter out very old tokens (> 7 days)
@@ -767,11 +727,7 @@ export class EnhancedTokenScanner {
 
             // If no age criteria are set, be more permissive
             if (!this.validationCriteria.minTokenAge && !this.validationCriteria.maxTokenAge) {
-                // Only filter out tokens that are extremely new (< 30 seconds) or extremely old (> 7 days)
-                if (tokenData.ageSeconds < 30) {
-                    console.log(`❌ Token ${tokenData.symbol} too new: ${tokenData.ageSeconds}s < 30s`);
-                    return false;
-                }
+                // Only filter out tokens that are extremely old (> 7 days)
                 if (tokenData.ageSeconds > 604800) { // 7 days
                     console.log(`❌ Token ${tokenData.symbol} too old: ${tokenData.ageSeconds}s > 7 days`);
                     return false;

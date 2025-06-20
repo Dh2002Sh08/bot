@@ -3,7 +3,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.bot = void 0;
+exports.bot = exports.paperTradeBot = exports.sniperBot = void 0;
 const telegraf_1 = require("telegraf");
 const dotenv_1 = __importDefault(require("dotenv"));
 const ethers_1 = require("ethers");
@@ -18,7 +18,7 @@ exports.bot = bot;
 // Add to the top of the file after imports
 const userWallets = new Map();
 // Initialize SniperBot with callbacks that send messages to the user
-const sniperBot = new sniperBot_1.SniperBot({
+exports.sniperBot = new sniperBot_1.SniperBot({
     amount: 0.01, // Default amount for buys
     slippage: 10, // Default slippage
     stopLoss: 20, // Default stop loss
@@ -48,7 +48,7 @@ const sniperBot = new sniperBot_1.SniperBot({
     }
 });
 // Initialize Paper Trading Bot with callbacks that send messages to the user
-const paperTradeBot = new paperTradeBot_1.PaperTradeBot({
+exports.paperTradeBot = new paperTradeBot_1.PaperTradeBot({
     amount: 0.01, // Default amount for buys
     slippage: 10, // Default slippage
     stopLoss: 20, // Default stop loss
@@ -86,7 +86,7 @@ const mainKeyboard = telegraf_1.Markup.keyboard([
     ['🔄 Start Sniper Bot', '👛 Create Wallet'],
     ['📈 User Sniped Token', '⚙️ Settings'],
     ['📊 Paper Trading', '❌ Stop Bot'],
-    ['/loadwallet']
+    ['🔐 Recover Wallet', '/loadwallet']
 ]).resize();
 // Modify the wallet network keyboard to include activate/deactivate buttons
 const walletNetworkKeyboard = telegraf_1.Markup.keyboard([
@@ -114,6 +114,7 @@ const backToMainKeyboard = telegraf_1.Markup.keyboard([
 const startSuggestionsKeyboard = telegraf_1.Markup.inlineKeyboard([
     [telegraf_1.Markup.button.callback('🚀 Start Sniper Bot', 'start_sniper')],
     [telegraf_1.Markup.button.callback('👛 Create/View Wallet', 'manage_wallets')],
+    [telegraf_1.Markup.button.callback('🔐 Recover Wallet', 'recover_wallet')],
     [telegraf_1.Markup.button.callback('📈 Buy Token', 'buy_token')],
     [telegraf_1.Markup.button.callback('📊 Paper Trading', 'paper_trading')],
     [telegraf_1.Markup.button.callback('⚙️ Settings', 'settings')]
@@ -123,6 +124,27 @@ const walletManagementKeyboard = telegraf_1.Markup.keyboard([
     [telegraf_1.Markup.button.text('🔷 ETH Wallet'), telegraf_1.Markup.button.text('🔷 Deactivate ETH')],
     [telegraf_1.Markup.button.text('🟡 BSC Wallet'), telegraf_1.Markup.button.text('🟡 Deactivate BSC')],
     [telegraf_1.Markup.button.text('🟣 SOL Wallet'), telegraf_1.Markup.button.text('🟣 Deactivate SOL')],
+    ['🔙 Back to Main']
+]).resize();
+// Add Yes/No keyboard
+const yesNoKeyboard = telegraf_1.Markup.keyboard([
+    ['✅ Yes', '❌ No']
+]).resize();
+// Add Paper Trading Wallet Management Keyboard
+const paperWalletManagementKeyboard = telegraf_1.Markup.keyboard([
+    ['🔷 ETH Wallet', '🔷 Deactivate ETH'],
+    ['🟡 BSC Wallet', '🟡 Deactivate BSC'],
+    ['🟣 SOL Wallet', '🟣 Deactivate SOL'],
+    ['🔙 Back to Paper Trading']
+]).resize();
+// Add Activate/Deactivate Paper Wallet buttons to the main paper trading keyboard
+const paperTradingKeyboard = telegraf_1.Markup.keyboard([
+    ['🚀 Start Paper Trading', '🛑 Stop Paper Trading'],
+    ['👛 Create Paper Wallet', '💰 Paper Trading Balance'],
+    ['📈 Active Positions', '📊 Trading History'],
+    ['🔷 Activate ETH Paper Wallet', '🔷 Deactivate ETH Paper Wallet'],
+    ['🟡 Activate BSC Paper Wallet', '🟡 Deactivate BSC Paper Wallet'],
+    ['🟣 Activate SOL Paper Wallet', '🟣 Deactivate SOL Paper Wallet'],
     ['🔙 Back to Main']
 ]).resize();
 // --- COMMAND HANDLERS ---
@@ -153,7 +175,7 @@ bot.command('start', async (ctx) => {
     //     await ctx.reply(balanceMessage, { parse_mode: 'Markdown' });
     // }
     // Show configuration status
-    const userConfig = sniperBot.getUserConfig(userId);
+    const userConfig = exports.sniperBot.getUserConfig(userId);
     if (userConfig) {
         await ctx.reply('📊 Current Configuration:\n\n' +
             `Amount: ${userConfig.amount} ETH/BNB/SOL\n` +
@@ -167,21 +189,94 @@ bot.command('start', async (ctx) => {
     }
     await ctx.reply('Welcome to the Sniper Bot! 🚀 Please choose an option:', startSuggestionsKeyboard);
 });
+bot.command('config', async (ctx) => {
+    const userId = ctx.from?.id;
+    if (!userId)
+        return;
+    await ctx.reply('⚙️ Let\'s set up your trading configuration!');
+    await ctx.scene.enter('configWizard');
+});
+// Add /loadwallet command handler
+bot.command('loadwallet', async (ctx) => {
+    const userId = ctx.from?.id;
+    if (!userId)
+        return;
+    try {
+        await ctx.reply('🔄 Loading existing wallets...');
+        // Check if user has any wallets configured
+        const hasEthWallet = exports.sniperBot.hasUserWallet(userId, 'ETH');
+        const hasBscWallet = exports.sniperBot.hasUserWallet(userId, 'BSC');
+        const hasSolWallet = exports.sniperBot.hasUserWallet(userId, 'SOL');
+        if (!hasEthWallet && !hasBscWallet && !hasSolWallet) {
+            await ctx.reply('❌ No wallets found. Please create wallets first using the "👛 Create Wallet" option.');
+            return;
+        }
+        // Show wallet balances
+        let balanceMessage = '📊 Your Wallets:\n\n';
+        for (const network of ['ETH', 'BSC', 'SOL']) {
+            const wallet = exports.sniperBot.getUserWallet(userId, network);
+            if (wallet) {
+                try {
+                    const balance = await exports.sniperBot.getWalletBalance(userId, network);
+                    balanceMessage += `${network === 'ETH' ? '🔷' : network === 'BSC' ? '🟡' : '🟣'} ${network}:\n`;
+                    balanceMessage += `Address: \`${wallet.address}\`\n`;
+                    balanceMessage += `Balance: ${balance}\n\n`;
+                }
+                catch (error) {
+                    balanceMessage += `${network === 'ETH' ? '🔷' : network === 'BSC' ? '🟡' : '🟣'} ${network}:\n`;
+                    balanceMessage += `Address: \`${wallet.address}\`\n`;
+                    balanceMessage += `Balance: Error loading balance\n\n`;
+                }
+            }
+        }
+        await ctx.reply(balanceMessage, { parse_mode: 'Markdown' });
+        await ctx.reply('✅ Wallets loaded successfully!', mainKeyboard);
+    }
+    catch (error) {
+        console.error('Error loading wallets:', error);
+        await ctx.reply(`❌ Error loading wallets: ${error.message}`);
+    }
+});
 // --- ACTION HANDLERS for inline keyboard --- //
 bot.action('start_sniper', async (ctx) => {
     await ctx.answerCbQuery(); // Dismiss the loading spinner on the button
     const userId = ctx.from?.id;
     if (!userId)
         return;
-    const hasEthWallet = sniperBot.hasUserWallet(userId, 'ETH');
-    const hasBscWallet = sniperBot.hasUserWallet(userId, 'BSC');
-    const hasSolWallet = sniperBot.hasUserWallet(userId, 'SOL');
+    const hasEthWallet = exports.sniperBot.hasUserWallet(userId, 'ETH');
+    const hasBscWallet = exports.sniperBot.hasUserWallet(userId, 'BSC');
+    const hasSolWallet = exports.sniperBot.hasUserWallet(userId, 'SOL');
     if (!hasEthWallet && !hasBscWallet && !hasSolWallet) {
         await ctx.reply('⚠️ No wallets configured. Please create a wallet first.', walletNetworkKeyboard);
         return;
     }
+    // Ensure user has a default configuration to receive token detection messages
+    const existingConfig = exports.sniperBot.getUserConfig(userId);
+    if (!existingConfig) {
+        const defaultConfig = {
+            amount: 0.01, // Default amount for buys
+            slippage: 10, // Default slippage
+            stopLoss: 20, // Default stop loss
+            takeProfit: 200, // Default take profit
+            onLog: exports.sniperBot.getLogCallback(),
+            onError: exports.sniperBot.getErrorCallback()
+        };
+        exports.sniperBot.updateUserConfig(userId, defaultConfig);
+        console.log(`✅ Set default configuration for user ${userId}`);
+    }
+    // Ensure user has default validation criteria
+    const existingCriteria = exports.sniperBot.getUserValidationCriteria(userId);
+    if (!existingCriteria) {
+        const defaultCriteria = {
+            minLiquidity: 1000,
+            minVolume: 25,
+            requireDexScreener: true
+        };
+        exports.sniperBot.setUserValidationCriteria(userId, defaultCriteria);
+        console.log(`✅ Set default validation criteria for user ${userId}`);
+    }
     await ctx.reply('🚀 Starting Sniper Bot in background...');
-    sniperBot.startBackgroundMonitoring(userId);
+    exports.sniperBot.startBackgroundMonitoring(userId);
     await ctx.reply('✅ Sniper Bot is now running in the background!\n\n' +
         '📊 Status:\n' +
         `🔷 ETH: ${hasEthWallet ? '✅' : '❌'}\n` +
@@ -197,6 +292,10 @@ bot.action('buy_token', async (ctx) => {
     await ctx.answerCbQuery();
     await ctx.scene.enter('tokenInput');
 });
+bot.action('recover_wallet', async (ctx) => {
+    await ctx.answerCbQuery();
+    await ctx.scene.enter('walletRecovery');
+});
 bot.action('settings', async (ctx) => {
     await ctx.answerCbQuery();
     await ctx.reply('Settings menu is under development.', backToMainKeyboard);
@@ -206,12 +305,6 @@ bot.action('paper_trading', async (ctx) => {
     const userId = ctx.from?.id;
     if (!userId)
         return;
-    const paperTradingKeyboard = telegraf_1.Markup.keyboard([
-        ['🚀 Start Paper Trading', '🛑 Stop Paper Trading'],
-        ['👛 Create Paper Wallet', '💰 Paper Trading Balance'],
-        ['📈 Active Positions', '📊 Trading History'],
-        ['🔙 Back to Main']
-    ]).resize();
     await ctx.reply('📊 Welcome to Paper Trading!\n\n' +
         'This feature allows you to test the sniper bot with dummy coins.\n' +
         'You\'ll get:\n' +
@@ -226,6 +319,28 @@ bot.hears('🔄 Start Sniper Bot', async (ctx) => {
 });
 bot.hears('👛 Create Wallet', async (ctx) => {
     await ctx.reply('Please use the inline button for "Create/View Wallet".', startSuggestionsKeyboard);
+});
+// Add Recover Wallet handler
+bot.hears('🔐 Recover Wallet', async (ctx) => {
+    await ctx.scene.enter('walletRecovery');
+});
+// Add Stop Bot handler
+bot.hears('❌ Stop Bot', async (ctx) => {
+    const userId = ctx.from?.id;
+    if (!userId)
+        return;
+    try {
+        await ctx.reply('🛑 Stopping all bots...');
+        // Stop sniper bot
+        exports.sniperBot.stopBackgroundMonitoring(userId);
+        // Stop paper trading
+        exports.paperTradeBot.stopPaperTrading(userId);
+        await ctx.reply('✅ All bots stopped successfully!', mainKeyboard);
+    }
+    catch (error) {
+        console.error('Error stopping bots:', error);
+        await ctx.reply(`❌ Error stopping bots: ${error.message}`, mainKeyboard);
+    }
 });
 // Modify the wallet creation handler
 bot.hears(['👛 Create ETH Wallet', '👛 Create BSC Wallet', '👛 Create SOL Wallet'], async (ctx) => {
@@ -262,7 +377,7 @@ bot.hears(['👛 Create ETH Wallet', '👛 Create BSC Wallet', '👛 Create SOL 
             privateKey: wallet.privateKey
         });
         // Set wallet in SniperBot
-        sniperBot.setUserWallet(userId, network, wallet.privateKey);
+        exports.sniperBot.setUserWallet(userId, network, wallet.privateKey);
         // Create keyboard with balance check button
         const keyboard = telegraf_1.Markup.keyboard([
             [telegraf_1.Markup.button.text(`💰 Check ${network} Balance`)],
@@ -316,11 +431,11 @@ bot.hears(['🔷 Activate ETH', '🟡 Activate BSC', '🟣 Activate SOL', '🔷 
     }
     walletState.isActive = isActivate;
     if (isActivate) {
-        sniperBot.setUserWallet(userId, network, walletState.privateKey);
+        exports.sniperBot.setUserWallet(userId, network, walletState.privateKey);
         await ctx.reply(`✅ ${network} wallet activated!`, walletManagementKeyboard);
     }
     else {
-        sniperBot.removeUserWallet(userId, network);
+        exports.sniperBot.removeUserWallet(userId, network);
         await ctx.reply(`🛑 ${network} wallet deactivated!`, walletNetworkKeyboard);
     }
 });
@@ -339,7 +454,7 @@ bot.hears(['🔷 ETH Wallet', '🟡 BSC Wallet', '🟣 SOL Wallet'], async (ctx)
         return;
     }
     const walletState = userWalletMap.get(network);
-    const wallet = sniperBot.getUserWallet(userId, network);
+    const wallet = exports.sniperBot.getUserWallet(userId, network);
     if (wallet) {
         const replyMessage = await ctx.reply(`✅ ${network} Wallet:\n\n` +
             `Address: \`${wallet.address}\`\n` +
@@ -361,12 +476,6 @@ bot.hears('📊 Paper Trading', async (ctx) => {
     const userId = ctx.from?.id;
     if (!userId)
         return;
-    const paperTradingKeyboard = telegraf_1.Markup.keyboard([
-        ['🚀 Start Paper Trading', '🛑 Stop Paper Trading'],
-        ['👛 Create Paper Wallet', '💰 Paper Trading Balance'],
-        ['📈 Active Positions', '📊 Trading History'],
-        ['🔙 Back to Main']
-    ]).resize();
     await ctx.reply('📊 Welcome to Paper Trading!\n\n' +
         'This feature allows you to test the sniper bot with dummy coins.\n' +
         'You\'ll get:\n' +
@@ -395,12 +504,13 @@ bot.hears(['🔷 Create ETH Paper Wallet', '🟡 Create BSC Paper Wallet', '🟣
         networkText.includes('BSC') ? 'BSC' :
             'SOL';
     try {
-        const wallet = paperTradeBot.createPaperWallet(userId, network);
+        const wallet = exports.paperTradeBot.createPaperWallet(userId, network);
         const paperTradingKeyboard = telegraf_1.Markup.keyboard([
             ['🚀 Start Paper Trading', '🛑 Stop Paper Trading'],
             ['👛 Create Paper Wallet', '💰 Paper Trading Balance'],
             ['📈 Active Positions', '📊 Trading History'],
-            ['🔙 Back to Main']
+            ['📈 Trading Statistics', '💰 Check Paper Balance'],
+            ['📊 Set Paper Trading Config', '🔙 Back to Main']
         ]).resize();
         await ctx.reply(`✅ ${network} Paper Trading Wallet Created!\n\n` +
             `Address: \`${wallet.address}\`\n` +
@@ -419,59 +529,69 @@ bot.hears('🚀 Start Paper Trading', async (ctx) => {
     const userId = ctx.from?.id;
     if (!userId)
         return;
-    const hasEthWallet = paperTradeBot.hasUserWallet(userId, 'ETH');
-    const hasBscWallet = paperTradeBot.hasUserWallet(userId, 'BSC');
-    const hasSolWallet = paperTradeBot.hasUserWallet(userId, 'SOL');
+    const hasEthWallet = exports.paperTradeBot.hasUserWallet(userId, 'ETH');
+    const hasBscWallet = exports.paperTradeBot.hasUserWallet(userId, 'BSC');
+    const hasSolWallet = exports.paperTradeBot.hasUserWallet(userId, 'SOL');
     if (!hasEthWallet && !hasBscWallet && !hasSolWallet) {
         await ctx.reply('⚠️ No paper trading wallets configured. Please create wallets first.');
         return;
     }
-    // Set default config if not set
-    const userConfig = paperTradeBot.getUserConfig(userId);
+    // Check if user has configuration set
+    const userConfig = exports.paperTradeBot.getUserConfig(userId);
     if (!userConfig) {
-        paperTradeBot.updateUserConfig(userId, {
-            amount: 0.01,
-            slippage: 10,
-            stopLoss: 20,
-            takeProfit: 200,
-            onLog: paperTradeBot.getLogCallback(),
-            onError: paperTradeBot.getErrorCallback()
-        });
+        await ctx.reply('⚠️ No paper trading configuration set. Please configure your trading parameters first.', telegraf_1.Markup.keyboard([
+            ['📊 Set Paper Trading Config'],
+            ['🔙 Back to Main']
+        ]).resize());
+        return;
     }
-    await paperTradeBot.startPaperTrading(userId);
+    // Ensure user has default validation criteria for paper trading
+    const existingCriteria = exports.paperTradeBot.getUserValidationCriteria(userId);
+    if (!existingCriteria) {
+        const defaultCriteria = {
+            minLiquidity: 1000,
+            minVolume: 25,
+            requireDexScreener: true
+        };
+        exports.paperTradeBot.setUserValidationCriteria(userId, defaultCriteria);
+        console.log(`✅ Set default validation criteria for paper trading user ${userId}`);
+    }
+    await exports.paperTradeBot.startPaperTrading(userId);
+    // Show current configuration
+    await ctx.reply('📊 Current Paper Trading Configuration:\n\n' +
+        `💰 Amount per token: ${userConfig.amount} ETH/BNB/SOL\n` +
+        `📊 Slippage: ${userConfig.slippage}%\n` +
+        `🛑 Stop Loss: ${userConfig.stopLoss}%\n` +
+        `🎯 Take Profit: ${userConfig.takeProfit}%\n\n` +
+        'The bot will continuously detect and trade tokens based on these settings.', mainKeyboard);
 });
 // Stop Paper Trading
 bot.hears('🛑 Stop Paper Trading', async (ctx) => {
     const userId = ctx.from?.id;
     if (!userId)
         return;
-    paperTradeBot.stopPaperTrading(userId);
+    exports.paperTradeBot.stopPaperTrading(userId);
 });
-// Paper Trading Balance
+// Handle Paper Trading Balance button
 bot.hears('💰 Paper Trading Balance', async (ctx) => {
     const userId = ctx.from?.id;
     if (!userId)
         return;
-    const networks = ['ETH', 'BSC', 'SOL'];
-    let balanceMessage = '💰 Paper Trading Balances:\n\n';
-    for (const network of networks) {
-        if (paperTradeBot.hasUserWallet(userId, network)) {
-            const balance = await paperTradeBot.getWalletBalance(userId, network);
-            const emoji = network === 'ETH' ? '🔷' : network === 'BSC' ? '🟡' : '🟣';
-            balanceMessage += `${emoji} ${network}: ${balance}\n`;
-        }
-    }
-    if (balanceMessage === '💰 Paper Trading Balances:\n\n') {
-        balanceMessage = '❌ No paper trading wallets found. Please create wallets first.';
-    }
-    await ctx.reply(balanceMessage);
+    await exports.paperTradeBot.showPaperTradingBalances(userId);
+});
+// Handle Check Paper Balance button (manual update)
+bot.hears('💰 Check Paper Balance', async (ctx) => {
+    const userId = ctx.from?.id;
+    if (!userId)
+        return;
+    await exports.paperTradeBot.checkPaperWalletBalances(userId);
 });
 // Active Positions
 bot.hears('📈 Active Positions', async (ctx) => {
     const userId = ctx.from?.id;
     if (!userId)
         return;
-    const activePositions = paperTradeBot.getActivePositions(userId);
+    const activePositions = exports.paperTradeBot.getActivePositions(userId);
     if (activePositions.length === 0) {
         await ctx.reply('📈 No active positions in paper trading.');
         return;
@@ -493,7 +613,7 @@ bot.hears('📊 Trading History', async (ctx) => {
     const userId = ctx.from?.id;
     if (!userId)
         return;
-    const tradingHistory = paperTradeBot.getTradingHistory(userId);
+    const tradingHistory = exports.paperTradeBot.getTradingHistory(userId);
     if (tradingHistory.length === 0) {
         await ctx.reply('📊 No trading history in paper trading.');
         return;
@@ -511,19 +631,54 @@ bot.hears('📊 Trading History', async (ctx) => {
     }
     await ctx.reply(historyMessage);
 });
+// Trading Statistics
+bot.hears('📈 Trading Statistics', async (ctx) => {
+    const userId = ctx.from?.id;
+    if (!userId)
+        return;
+    const tradingHistory = exports.paperTradeBot.getTradingHistory(userId);
+    const activePositions = exports.paperTradeBot.getActivePositions(userId);
+    if (tradingHistory.length === 0 && activePositions.length === 0) {
+        await ctx.reply('📈 No trading activity found.');
+        return;
+    }
+    // Calculate statistics
+    let totalTrades = tradingHistory.length;
+    let winningTrades = 0;
+    let totalProfit = 0;
+    let totalInvested = 0;
+    for (const trade of tradingHistory) {
+        const profitLoss = trade.amount * (trade.currentPrice - trade.entryPrice);
+        totalProfit += profitLoss;
+        totalInvested += trade.amount * trade.entryPrice;
+        if (profitLoss > 0)
+            winningTrades++;
+    }
+    const winRate = totalTrades > 0 ? (winningTrades / totalTrades) * 100 : 0;
+    const totalReturn = totalInvested > 0 ? (totalProfit / totalInvested) * 100 : 0;
+    let statsMessage = '📈 Paper Trading Statistics:\n\n';
+    statsMessage += `📊 Total Trades: ${totalTrades}\n`;
+    statsMessage += `✅ Winning Trades: ${winningTrades}\n`;
+    statsMessage += `📈 Win Rate: ${winRate.toFixed(1)}%\n`;
+    statsMessage += `💰 Total Profit: ${totalProfit >= 0 ? '+' : ''}${totalProfit.toFixed(4)} ETH/BNB/SOL\n`;
+    statsMessage += `📊 Total Return: ${totalReturn >= 0 ? '+' : ''}${totalReturn.toFixed(2)}%\n`;
+    statsMessage += `📈 Active Positions: ${activePositions.length}\n\n`;
+    if (activePositions.length > 0) {
+        statsMessage += '🔄 Active Positions:\n';
+        for (const position of activePositions.slice(0, 3)) { // Show first 3
+            const priceChangePercent = ((position.currentPrice - position.entryPrice) / position.entryPrice) * 100;
+            statsMessage += `• ${position.tokenSymbol}: ${priceChangePercent >= 0 ? '+' : ''}${priceChangePercent.toFixed(2)}%\n`;
+        }
+    }
+    await ctx.reply(statsMessage);
+});
 // Back to Paper Trading
 bot.hears('🔙 Back to Paper Trading', async (ctx) => {
-    const paperTradingKeyboard = telegraf_1.Markup.keyboard([
-        ['🚀 Start Paper Trading', '🛑 Stop Paper Trading'],
-        ['👛 Create Paper Wallet', '💰 Paper Trading Balance'],
-        ['📈 Active Positions', '📊 Trading History'],
-        ['🔙 Back to Main']
-    ]).resize();
     await ctx.reply('📊 Paper Trading Menu:', paperTradingKeyboard);
 });
 // Back to Main
 bot.hears('🔙 Back to Main', async (ctx) => {
-    await ctx.reply('Main Menu:', mainKeyboard);
+    await ctx.reply('🏠 Main Menu', mainKeyboard);
 });
 // --- VALIDATION CRITERIA HANDLERS ---
 bot.hears('⚙️ Settings', async (ctx) => {
@@ -532,7 +687,8 @@ bot.hears('⚙️ Settings', async (ctx) => {
         return;
     const settingsKeyboard = telegraf_1.Markup.keyboard([
         ['📊 Set Validation Criteria', '📈 View Sniped Tokens'],
-        ['📊 View Paper Trading Tokens', '🔙 Back to Main']
+        ['📊 View Paper Trading Tokens', '⚙️ Set Trading Config'],
+        ['🔙 Back to Main']
     ]).resize();
     await ctx.reply('⚙️ Settings Menu:', settingsKeyboard);
 });
@@ -546,8 +702,8 @@ bot.hears('📊 Set Validation Criteria', async (ctx) => {
         ['⏰ Set Max Age', '🔙 Back to Settings']
     ]).resize();
     // Get current criteria
-    const sniperCriteria = sniperBot.getUserValidationCriteria(userId);
-    const paperCriteria = paperTradeBot.getUserValidationCriteria(userId);
+    const sniperCriteria = exports.sniperBot.getUserValidationCriteria(userId);
+    const paperCriteria = exports.paperTradeBot.getUserValidationCriteria(userId);
     let message = '📊 Current Validation Criteria:\n\n';
     message += '🔫 Sniper Bot:\n';
     if (sniperCriteria) {
@@ -575,7 +731,7 @@ bot.hears('📈 View Sniped Tokens', async (ctx) => {
     const userId = ctx.from?.id;
     if (!userId)
         return;
-    const snipedTokens = sniperBot.getUserSnipedTokens(userId);
+    const snipedTokens = exports.sniperBot.getUserSnipedTokens(userId);
     if (snipedTokens.length === 0) {
         await ctx.reply('📈 No sniped tokens found.');
         return;
@@ -601,7 +757,7 @@ bot.hears('📊 View Paper Trading Tokens', async (ctx) => {
     const userId = ctx.from?.id;
     if (!userId)
         return;
-    const paperTokens = paperTradeBot.getUserPaperTradedTokens(userId);
+    const paperTokens = exports.paperTradeBot.getUserPaperTradedTokens(userId);
     if (paperTokens.length === 0) {
         await ctx.reply('📊 No paper trading tokens found.');
         return;
@@ -629,7 +785,569 @@ bot.hears('🔙 Back to Settings', async (ctx) => {
         return;
     const settingsKeyboard = telegraf_1.Markup.keyboard([
         ['📊 Set Validation Criteria', '📈 View Sniped Tokens'],
-        ['📊 View Paper Trading Tokens', '🔙 Back to Main']
+        ['📊 View Paper Trading Tokens', '⚙️ Set Trading Config'],
+        ['🔙 Back to Main']
     ]).resize();
     await ctx.reply('⚙️ Settings Menu:', settingsKeyboard);
+});
+// Handle Set Trading Config button
+bot.hears('⚙️ Set Trading Config', async (ctx) => {
+    const userId = ctx.from?.id;
+    if (!userId)
+        return;
+    await ctx.scene.enter('configWizard');
+});
+// Handle Paper Trading Config button
+bot.hears('📊 Set Paper Trading Config', async (ctx) => {
+    const userId = ctx.from?.id;
+    if (!userId)
+        return;
+    const userConfig = exports.paperTradeBot.getUserConfig(userId);
+    if (userConfig) {
+        await ctx.reply('📊 Current Paper Trading Configuration:\n\n' +
+            `💰 Amount per token: ${userConfig.amount} ETH/BNB/SOL\n` +
+            `📊 Slippage: ${userConfig.slippage}%\n` +
+            `🛑 Stop Loss: ${userConfig.stopLoss}%\n` +
+            `🎯 Take Profit: ${userConfig.takeProfit}%\n\n` +
+            'Would you like to update these settings?', yesNoKeyboard);
+    }
+    else {
+        await ctx.scene.enter('paperTradingConfigWizard');
+    }
+});
+// Yes/No response handler
+bot.hears('✅ Yes', async (ctx) => {
+    // Start the config wizard (assuming you have a scene or function for this)
+    await ctx.scene.enter('paperTradingConfigWizard');
+});
+bot.hears('❌ No', async (ctx) => {
+    await ctx.reply('No changes made to your paper trading configuration.', mainKeyboard);
+});
+const configWizard = new telegraf_1.Scenes.WizardScene('configWizard', async (ctx) => {
+    await ctx.reply('Please enter the default amount for trades (e.g., 0.01 for 0.01 ETH/BNB/SOL):', telegraf_1.Markup.keyboard([
+        ['🔙 Back to Main']
+    ]).resize());
+    return ctx.wizard.next();
+}, async (ctx) => {
+    if (ctx.message && 'text' in ctx.message) {
+        if (ctx.message.text === '🔙 Back to Main') {
+            await ctx.reply('🏠 Main Menu', mainKeyboard);
+            return ctx.scene.leave();
+        }
+        const amount = parseFloat(ctx.message.text);
+        if (isNaN(amount) || amount <= 0) {
+            await ctx.reply('❌ Invalid amount. Please enter a positive number.');
+            return;
+        }
+        ctx.session.amount = amount; // Store in session
+        await ctx.reply('Please enter the slippage percentage (e.g., 10 for 10%):', telegraf_1.Markup.keyboard([
+            ['🔙 Back to Main']
+        ]).resize());
+        return ctx.wizard.next();
+    }
+    await ctx.reply('Please enter a valid amount.');
+}, async (ctx) => {
+    if (ctx.message && 'text' in ctx.message) {
+        if (ctx.message.text === '🔙 Back to Main') {
+            await ctx.reply('🏠 Main Menu', mainKeyboard);
+            return ctx.scene.leave();
+        }
+        const slippage = parseFloat(ctx.message.text);
+        if (isNaN(slippage) || slippage < 0 || slippage > 100) {
+            await ctx.reply('❌ Invalid slippage. Please enter a number between 0 and 100.');
+            return;
+        }
+        ctx.session.slippage = slippage; // Store in session
+        await ctx.reply('Please enter the stop loss percentage (e.g., 20 for 20% loss):', telegraf_1.Markup.keyboard([
+            ['🔙 Back to Main']
+        ]).resize());
+        return ctx.wizard.next();
+    }
+    await ctx.reply('Please enter a valid slippage.');
+}, async (ctx) => {
+    if (ctx.message && 'text' in ctx.message) {
+        if (ctx.message.text === '🔙 Back to Main') {
+            await ctx.reply('🏠 Main Menu', mainKeyboard);
+            return ctx.scene.leave();
+        }
+        const stopLoss = parseFloat(ctx.message.text);
+        if (isNaN(stopLoss) || stopLoss < 0) {
+            await ctx.reply('❌ Invalid stop loss. Please enter a positive number.');
+            return;
+        }
+        ctx.session.stopLoss = stopLoss; // Store in session
+        await ctx.reply('Please enter the take profit percentage (e.g., 200 for 200% profit):', telegraf_1.Markup.keyboard([
+            ['🔙 Back to Main']
+        ]).resize());
+        return ctx.wizard.next();
+    }
+    await ctx.reply('Please enter a valid stop loss.');
+}, async (ctx) => {
+    if (ctx.message && 'text' in ctx.message) {
+        if (ctx.message.text === '🔙 Back to Main') {
+            await ctx.reply('🏠 Main Menu', mainKeyboard);
+            return ctx.scene.leave();
+        }
+        const takeProfit = parseFloat(ctx.message.text);
+        if (isNaN(takeProfit) || takeProfit < 0) {
+            await ctx.reply('❌ Invalid take profit. Please enter a positive number.');
+            return;
+        }
+        ctx.session.takeProfit = takeProfit; // Store in session
+        const userId = ctx.from?.id;
+        if (!userId) {
+            await ctx.reply('❌ Error: Could not get user ID.');
+            return ctx.scene.leave();
+        }
+        // Update both sniper and paper trade bot configs
+        const newConfig = {
+            amount: ctx.session.amount,
+            slippage: ctx.session.slippage,
+            stopLoss: ctx.session.stopLoss,
+            takeProfit: ctx.session.takeProfit,
+            onLog: exports.sniperBot.getLogCallback(), // Use sniper bot's log/error callbacks
+            onError: exports.sniperBot.getErrorCallback()
+        };
+        exports.sniperBot.updateUserConfig(userId, newConfig);
+        exports.paperTradeBot.updateUserConfig(userId, newConfig);
+        await ctx.reply('✅ Trading configuration updated for both bots!', telegraf_1.Markup.removeKeyboard());
+        await ctx.reply('📊 Current Configuration:\n\n' +
+            `Amount: ${newConfig.amount} ETH/BNB/SOL\n` +
+            `Slippage: ${newConfig.slippage}%\n` +
+            `Stop Loss: ${newConfig.stopLoss}%\n` +
+            `Take Profit: ${newConfig.takeProfit}%`, mainKeyboard);
+        return ctx.scene.leave();
+    }
+    await ctx.reply('Please enter a valid take profit.');
+});
+// Register the scene
+stage.register(configWizard);
+// Paper Trading Configuration Wizard
+const paperTradingConfigWizard = new telegraf_1.Scenes.WizardScene('paperTradingConfigWizard', async (ctx) => {
+    await ctx.reply('📊 Paper Trading Configuration\n\nPlease enter the amount you want to invest per token (e.g., 0.01 for 0.01 ETH/BNB/SOL):', telegraf_1.Markup.keyboard([
+        ['🔙 Back to Main']
+    ]).resize());
+    return ctx.wizard.next();
+}, async (ctx) => {
+    if (ctx.message && 'text' in ctx.message) {
+        if (ctx.message.text === '🔙 Back to Main') {
+            await ctx.reply('🏠 Main Menu', mainKeyboard);
+            return ctx.scene.leave();
+        }
+        const amount = parseFloat(ctx.message.text);
+        if (isNaN(amount) || amount <= 0) {
+            await ctx.reply('❌ Invalid amount. Please enter a positive number.');
+            return;
+        }
+        ctx.session.amount = amount;
+        await ctx.reply('Please enter the slippage percentage (e.g., 10 for 10%):', telegraf_1.Markup.keyboard([
+            ['🔙 Back to Main']
+        ]).resize());
+        return ctx.wizard.next();
+    }
+    await ctx.reply('Please enter a valid amount.');
+}, async (ctx) => {
+    if (ctx.message && 'text' in ctx.message) {
+        if (ctx.message.text === '🔙 Back to Main') {
+            await ctx.reply('🏠 Main Menu', mainKeyboard);
+            return ctx.scene.leave();
+        }
+        const slippage = parseFloat(ctx.message.text);
+        if (isNaN(slippage) || slippage < 0 || slippage > 100) {
+            await ctx.reply('❌ Invalid slippage. Please enter a number between 0 and 100.');
+            return;
+        }
+        ctx.session.slippage = slippage;
+        await ctx.reply('Please enter the stop loss percentage (e.g., 20 for 20% loss):', telegraf_1.Markup.keyboard([
+            ['🔙 Back to Main']
+        ]).resize());
+        return ctx.wizard.next();
+    }
+    await ctx.reply('Please enter a valid slippage.');
+}, async (ctx) => {
+    if (ctx.message && 'text' in ctx.message) {
+        if (ctx.message.text === '🔙 Back to Main') {
+            await ctx.reply('🏠 Main Menu', mainKeyboard);
+            return ctx.scene.leave();
+        }
+        const stopLoss = parseFloat(ctx.message.text);
+        if (isNaN(stopLoss) || stopLoss < 0) {
+            await ctx.reply('❌ Invalid stop loss. Please enter a positive number.');
+            return;
+        }
+        ctx.session.stopLoss = stopLoss;
+        await ctx.reply('Please enter the take profit percentage (e.g., 200 for 200% profit):', telegraf_1.Markup.keyboard([
+            ['🔙 Back to Main']
+        ]).resize());
+        return ctx.wizard.next();
+    }
+    await ctx.reply('Please enter a valid stop loss.');
+}, async (ctx) => {
+    if (ctx.message && 'text' in ctx.message) {
+        if (ctx.message.text === '🔙 Back to Main') {
+            await ctx.reply('🏠 Main Menu', mainKeyboard);
+            return ctx.scene.leave();
+        }
+        const takeProfit = parseFloat(ctx.message.text);
+        if (isNaN(takeProfit) || takeProfit < 0) {
+            await ctx.reply('❌ Invalid take profit. Please enter a positive number.');
+            return;
+        }
+        ctx.session.takeProfit = takeProfit;
+        const userId = ctx.from?.id;
+        if (!userId) {
+            await ctx.reply('❌ Error: Could not get user ID.');
+            return ctx.scene.leave();
+        }
+        // Update paper trade bot config
+        const newConfig = {
+            amount: ctx.session.amount,
+            slippage: ctx.session.slippage,
+            stopLoss: ctx.session.stopLoss,
+            takeProfit: ctx.session.takeProfit,
+            onLog: exports.paperTradeBot.getLogCallback(),
+            onError: exports.paperTradeBot.getErrorCallback()
+        };
+        exports.paperTradeBot.updateUserConfig(userId, newConfig);
+        await ctx.reply('✅ Paper Trading configuration updated!', telegraf_1.Markup.removeKeyboard());
+        await ctx.reply('📊 Paper Trading Configuration:\n\n' +
+            `💰 Amount per token: ${newConfig.amount} ETH/BNB/SOL\n` +
+            `📊 Slippage: ${newConfig.slippage}%\n` +
+            `🛑 Stop Loss: ${newConfig.stopLoss}%\n` +
+            `🎯 Take Profit: ${newConfig.takeProfit}%`, mainKeyboard);
+        return ctx.scene.leave();
+    }
+    await ctx.reply('Please enter a valid take profit.');
+});
+// Register the paper trading config scene
+stage.register(paperTradingConfigWizard);
+// Token Input Scene for buying tokens
+const tokenInputScene = new telegraf_1.Scenes.WizardScene('tokenInput', async (ctx) => {
+    await ctx.reply('🪙 Please enter the token address you want to buy:');
+    return ctx.wizard.next();
+}, async (ctx) => {
+    if (ctx.message && 'text' in ctx.message) {
+        const tokenAddress = ctx.message.text.trim();
+        // Basic validation
+        if (tokenAddress.length < 10) {
+            await ctx.reply('❌ Invalid token address. Please enter a valid token address.');
+            return;
+        }
+        const userId = ctx.from?.id;
+        if (!userId) {
+            await ctx.reply('❌ Error: Could not get user ID.');
+            return ctx.scene.leave();
+        }
+        try {
+            await ctx.reply('🔍 Processing token purchase...');
+            await exports.sniperBot.buyTokenFromUserInput(userId, tokenAddress);
+            await ctx.reply('✅ Token purchase completed!', mainKeyboard);
+        }
+        catch (error) {
+            console.error('Error buying token:', error);
+            await ctx.reply(`❌ Error buying token: ${error.message}`, mainKeyboard);
+        }
+        return ctx.scene.leave();
+    }
+    await ctx.reply('Please enter a valid token address.');
+});
+// Register the token input scene
+stage.register(tokenInputScene);
+// Wallet Recovery Scene
+const walletRecoveryScene = new telegraf_1.Scenes.WizardScene('walletRecovery', async (ctx) => {
+    await ctx.reply('🔐 Wallet Recovery\n\nPlease select the network for your wallet:', telegraf_1.Markup.keyboard([
+        ['🔷 ETH', '🟡 BSC', '🟣 SOL'],
+        ['🔙 Back to Main']
+    ]).resize());
+    return ctx.wizard.next();
+}, async (ctx) => {
+    if (ctx.message && 'text' in ctx.message) {
+        const networkText = ctx.message.text;
+        let network = null;
+        if (networkText.includes('ETH'))
+            network = 'ETH';
+        else if (networkText.includes('BSC'))
+            network = 'BSC';
+        else if (networkText.includes('SOL'))
+            network = 'SOL';
+        else if (networkText.includes('Back')) {
+            await ctx.reply('🏠 Main Menu', mainKeyboard);
+            return ctx.scene.leave();
+        }
+        if (!network) {
+            await ctx.reply('❌ Please select a valid network (ETH, BSC, or SOL).');
+            return;
+        }
+        ctx.session.network = network;
+        await ctx.reply(`🔐 Please enter your ${network} private key:`, telegraf_1.Markup.removeKeyboard());
+        return ctx.wizard.next();
+    }
+    await ctx.reply('Please select a valid network.');
+}, async (ctx) => {
+    if (ctx.message && 'text' in ctx.message) {
+        const privateKey = ctx.message.text.trim();
+        const network = ctx.session.network;
+        const userId = ctx.from?.id;
+        if (!userId || !network) {
+            await ctx.reply('❌ Error: Could not get user ID or network.');
+            return ctx.scene.leave();
+        }
+        try {
+            await ctx.reply('🔄 Recovering wallet...');
+            let wallet;
+            if (network === 'SOL') {
+                // For Solana, private key should be base58 encoded
+                const keypair = web3_js_1.Keypair.fromSecretKey(Buffer.from(privateKey, 'hex'));
+                wallet = {
+                    address: keypair.publicKey.toString(),
+                    privateKey: privateKey
+                };
+            }
+            else {
+                // For EVM chains
+                const evmWallet = new ethers_1.ethers.Wallet(privateKey);
+                wallet = {
+                    address: evmWallet.address,
+                    privateKey: privateKey
+                };
+            }
+            // Initialize user's wallet map if it doesn't exist
+            if (!userWallets.has(userId)) {
+                userWallets.set(userId, new Map());
+            }
+            // Store wallet with active state
+            userWallets.get(userId)?.set(network, {
+                isActive: true,
+                privateKey: wallet.privateKey
+            });
+            // Set wallet in SniperBot
+            exports.sniperBot.setUserWallet(userId, network, wallet.privateKey);
+            // Get wallet balance
+            const balance = await exports.sniperBot.getWalletBalance(userId, network);
+            const recoveryMessage = `✅ Wallet Recovered Successfully!\n\n` +
+                `🌐 Network: ${network}\n` +
+                `🔑 Public Key: \`${wallet.address}\`\n` +
+                `💰 Balance: ${balance}\n\n` +
+                `Status: Active`;
+            await ctx.reply(recoveryMessage, {
+                parse_mode: 'Markdown',
+                ...mainKeyboard
+            });
+            return ctx.scene.leave();
+        }
+        catch (error) {
+            console.error('Error recovering wallet:', error);
+            await ctx.reply(`❌ Failed to recover wallet: ${error.message}`, mainKeyboard);
+            return ctx.scene.leave();
+        }
+    }
+    await ctx.reply('Please enter a valid private key.');
+});
+// Register the wallet recovery scene
+stage.register(walletRecoveryScene);
+// Add balance check handler
+bot.hears(/💰 Check (ETH|BSC|SOL) Balance/, async (ctx) => {
+    const userId = ctx.from?.id;
+    if (!userId)
+        return;
+    const match = ctx.message.text.match(/💰 Check (ETH|BSC|SOL) Balance/);
+    if (!match)
+        return;
+    const network = match[1];
+    try {
+        await ctx.reply(`🔄 Checking ${network} balance...`);
+        const wallet = exports.sniperBot.getUserWallet(userId, network);
+        if (!wallet) {
+            await ctx.reply(`❌ No ${network} wallet found. Please create one first.`, walletNetworkKeyboard);
+            return;
+        }
+        const balance = await exports.sniperBot.getWalletBalance(userId, network);
+        const replyMessage = await ctx.reply(`💰 ${network} Wallet Balance:\n\n` +
+            `Address: \`${wallet.address}\`\n` +
+            `Balance: ${balance}\n\n` +
+            `Last updated: ${new Date().toLocaleString()}`, {
+            parse_mode: 'Markdown',
+            ...telegraf_1.Markup.keyboard([
+                ['🔙 Back to Main']
+            ]).resize()
+        });
+        // Auto-delete message after 2 minutes
+        setTimeout(async () => {
+            try {
+                await ctx.deleteMessage(replyMessage.message_id);
+            }
+            catch (error) {
+                console.error('Error deleting message for user (', userId, '):', error);
+            }
+        }, 120000);
+    }
+    catch (error) {
+        console.error(`Error checking ${network} balance:`, error);
+        await ctx.reply(`❌ Error checking ${network} balance: ${error.message}`, walletNetworkKeyboard);
+    }
+});
+// Add User Sniped Token handler
+bot.hears('📈 User Sniped Token', async (ctx) => {
+    const userId = ctx.from?.id;
+    if (!userId)
+        return;
+    const snipedTokens = exports.sniperBot.getUserSnipedTokens(userId);
+    if (snipedTokens.length === 0) {
+        await ctx.reply('📈 No sniped tokens found.');
+        return;
+    }
+    let message = '📈 Your Sniped Tokens:\n\n';
+    const recentTokens = snipedTokens.slice(0, 10); // Show last 10
+    for (const token of recentTokens) {
+        message += `🪙 ${token.symbol} (${token.name})\n`;
+        message += `🌐 Network: ${token.network}\n`;
+        message += `💰 Price: $${token.price.toFixed(8)}\n`;
+        message += `💧 Liquidity: $${token.liquidity.toLocaleString()}\n`;
+        message += `📊 Volume: $${token.volume24h.toLocaleString()}\n`;
+        message += `⏰ Age: ${token.age}\n`;
+        message += `📍 Address: \`${token.address}\`\n\n`;
+    }
+    if (snipedTokens.length > 10) {
+        message += `... and ${snipedTokens.length - 10} more tokens`;
+    }
+    await ctx.reply(message, { parse_mode: 'Markdown' });
+});
+// Add validation criteria setting handlers
+bot.hears('💧 Set Min Liquidity', async (ctx) => {
+    const userId = ctx.from?.id;
+    if (!userId)
+        return;
+    await ctx.reply('💧 Please enter the minimum liquidity amount (in USD):');
+    ctx.session.waitingFor = 'minLiquidity';
+});
+bot.hears('📊 Set Min Volume', async (ctx) => {
+    const userId = ctx.from?.id;
+    if (!userId)
+        return;
+    await ctx.reply('📊 Please enter the minimum 24h volume amount (in USD):');
+    ctx.session.waitingFor = 'minVolume';
+});
+bot.hears('⏰ Set Max Age', async (ctx) => {
+    const userId = ctx.from?.id;
+    if (!userId)
+        return;
+    await ctx.reply('⏰ Please enter the maximum token age in seconds (e.g., 3600 for 1 hour, 86400 for 1 day):');
+    ctx.session.waitingFor = 'maxAge';
+});
+// Handle validation criteria input
+bot.hears(/^\d+(\.\d+)?$/, async (ctx) => {
+    const userId = ctx.from?.id;
+    if (!userId || !ctx.session.waitingFor)
+        return;
+    const value = parseFloat(ctx.message.text);
+    if (isNaN(value) || value < 0) {
+        await ctx.reply('❌ Invalid value. Please enter a positive number.');
+        return;
+    }
+    try {
+        // Get current criteria
+        const sniperCriteria = exports.sniperBot.getUserValidationCriteria(userId) || {
+            minLiquidity: 100,
+            minVolume: 1,
+            requireDexScreener: true
+        };
+        // Update the specific criteria
+        switch (ctx.session.waitingFor) {
+            case 'minLiquidity':
+                sniperCriteria.minLiquidity = value;
+                await ctx.reply(`✅ Minimum liquidity set to $${value.toLocaleString()}`);
+                break;
+            case 'minVolume':
+                sniperCriteria.minVolume = value;
+                await ctx.reply(`✅ Minimum volume set to $${value.toLocaleString()}`);
+                break;
+            case 'maxAge':
+                sniperCriteria.maxAge = value;
+                await ctx.reply(`✅ Maximum age set to ${value} seconds`);
+                break;
+        }
+        // Update the criteria
+        exports.sniperBot.setUserValidationCriteria(userId, sniperCriteria);
+        // Clear the waiting state
+        ctx.session.waitingFor = undefined;
+        // Show updated criteria
+        const criteriaKeyboard = telegraf_1.Markup.keyboard([
+            ['💧 Set Min Liquidity', '📊 Set Min Volume'],
+            ['⏰ Set Max Age', '🔙 Back to Settings']
+        ]).resize();
+        let message = '📊 Updated Validation Criteria:\n\n';
+        message += `💧 Min Liquidity: $${sniperCriteria.minLiquidity.toLocaleString()}\n`;
+        message += `📊 Min Volume: $${sniperCriteria.minVolume.toLocaleString()}\n`;
+        message += `⏰ Max Age: ${sniperCriteria.maxAge ? `${sniperCriteria.maxAge}s` : 'No limit'}\n`;
+        await ctx.reply(message, criteriaKeyboard);
+    }
+    catch (error) {
+        console.error('Error updating validation criteria:', error);
+        await ctx.reply(`❌ Error updating criteria: ${error.message}`);
+    }
+});
+// Handler to show current paper trading config and ask if user wants to update
+bot.hears('📊 Show Paper Trading Config', async (ctx) => {
+    const userId = ctx.from?.id;
+    if (!userId)
+        return;
+    const config = exports.paperTradeBot.getUserConfig(userId);
+    if (!config) {
+        await ctx.reply('No paper trading config found.');
+        return;
+    }
+    const message = `Current Paper Trading Configuration:\n\n` +
+        `💰 Amount per token: ${config.amount} ETH/BNB/SOL\n` +
+        `📊 Slippage: ${config.slippage}%\n` +
+        `🛑 Stop Loss: ${config.stopLoss}%\n` +
+        `🎯 Take Profit: ${config.takeProfit}%\n\n` +
+        `Would you like to update these settings?`;
+    await ctx.reply(message, yesNoKeyboard);
+});
+// Handler to show wallet management options
+bot.hears('👛 Manage Paper Wallets', async (ctx) => {
+    await ctx.reply('Manage your paper trading wallets:', paperWalletManagementKeyboard);
+});
+// Handlers for activate/deactivate actions
+bot.hears('🔷 Activate ETH Paper Wallet', async (ctx) => {
+    const userId = ctx.from?.id;
+    if (!userId)
+        return;
+    exports.paperTradeBot.setPaperWalletActive(userId, 'ETH', true);
+    await ctx.reply('✅ ETH Paper Wallet activated.', paperWalletManagementKeyboard);
+});
+bot.hears('🔷 Deactivate ETH Paper Wallet', async (ctx) => {
+    const userId = ctx.from?.id;
+    if (!userId)
+        return;
+    exports.paperTradeBot.setPaperWalletActive(userId, 'ETH', false);
+    await ctx.reply('❌ ETH Paper Wallet deactivated.', paperWalletManagementKeyboard);
+});
+bot.hears('🟡 Activate BSC Paper Wallet', async (ctx) => {
+    const userId = ctx.from?.id;
+    if (!userId)
+        return;
+    exports.paperTradeBot.setPaperWalletActive(userId, 'BSC', true);
+    await ctx.reply('✅ BSC Paper Wallet activated.', paperWalletManagementKeyboard);
+});
+bot.hears('🟡 Deactivate BSC Paper Wallet', async (ctx) => {
+    const userId = ctx.from?.id;
+    if (!userId)
+        return;
+    exports.paperTradeBot.setPaperWalletActive(userId, 'BSC', false);
+    await ctx.reply('❌ BSC Paper Wallet deactivated.', paperWalletManagementKeyboard);
+});
+bot.hears('🟣 Activate SOL Paper Wallet', async (ctx) => {
+    const userId = ctx.from?.id;
+    if (!userId)
+        return;
+    exports.paperTradeBot.setPaperWalletActive(userId, 'SOL', true);
+    await ctx.reply('✅ SOL Paper Wallet activated.', paperWalletManagementKeyboard);
+});
+bot.hears('🟣 Deactivate SOL Paper Wallet', async (ctx) => {
+    const userId = ctx.from?.id;
+    if (!userId)
+        return;
+    exports.paperTradeBot.setPaperWalletActive(userId, 'SOL', false);
+    await ctx.reply('❌ SOL Paper Wallet deactivated.', paperWalletManagementKeyboard);
 });

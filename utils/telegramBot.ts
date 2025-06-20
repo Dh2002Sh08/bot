@@ -160,9 +160,9 @@ const yesNoKeyboard = Markup.keyboard([
 
 // Add Paper Trading Wallet Management Keyboard
 const paperWalletManagementKeyboard = Markup.keyboard([
-    ['🔷 Activate ETH Paper Wallet', '🔷 Deactivate ETH Paper Wallet'],
-    ['🟡 Activate BSC Paper Wallet', '🟡 Deactivate BSC Paper Wallet'],
-    ['🟣 Activate SOL Paper Wallet', '🟣 Deactivate SOL Paper Wallet'],
+    ['🔷 ETH Wallet', '🔷 Deactivate ETH'],
+    ['🟡 BSC Wallet', '🟡 Deactivate BSC'],
+    ['🟣 SOL Wallet', '🟣 Deactivate SOL'],
     ['🔙 Back to Paper Trading']
 ]).resize();
 
@@ -969,50 +969,82 @@ bot.hears('❌ No', async (ctx) => {
 const configWizard = new Scenes.WizardScene<MyContext>(
     'configWizard',
     async (ctx) => {
-        await ctx.reply('Please enter the default amount for trades (e.g., 0.01 for 0.01 ETH/BNB/SOL):');
+        await ctx.reply('Please enter the default amount for trades (e.g., 0.01 for 0.01 ETH/BNB/SOL):',
+            Markup.keyboard([
+                ['🔙 Back to Main']
+            ]).resize()
+        );
         return ctx.wizard.next();
     },
     async (ctx) => {
         if (ctx.message && 'text' in ctx.message) {
+            if (ctx.message.text === '🔙 Back to Main') {
+                await ctx.reply('🏠 Main Menu', mainKeyboard);
+                return ctx.scene.leave();
+            }
             const amount = parseFloat(ctx.message.text);
             if (isNaN(amount) || amount <= 0) {
                 await ctx.reply('❌ Invalid amount. Please enter a positive number.');
                 return;
             }
             ctx.session.amount = amount; // Store in session
-            await ctx.reply('Please enter the slippage percentage (e.g., 10 for 10%):');
+            await ctx.reply('Please enter the slippage percentage (e.g., 10 for 10%):',
+                Markup.keyboard([
+                    ['🔙 Back to Main']
+                ]).resize()
+            );
             return ctx.wizard.next();
         }
         await ctx.reply('Please enter a valid amount.');
     },
     async (ctx) => {
         if (ctx.message && 'text' in ctx.message) {
+            if (ctx.message.text === '🔙 Back to Main') {
+                await ctx.reply('🏠 Main Menu', mainKeyboard);
+                return ctx.scene.leave();
+            }
             const slippage = parseFloat(ctx.message.text);
             if (isNaN(slippage) || slippage < 0 || slippage > 100) {
                 await ctx.reply('❌ Invalid slippage. Please enter a number between 0 and 100.');
                 return;
             }
             ctx.session.slippage = slippage; // Store in session
-            await ctx.reply('Please enter the stop loss percentage (e.g., 20 for 20% loss):');
+            await ctx.reply('Please enter the stop loss percentage (e.g., 20 for 20% loss):',
+                Markup.keyboard([
+                    ['🔙 Back to Main']
+                ]).resize()
+            );
         return ctx.wizard.next();
         }
         await ctx.reply('Please enter a valid slippage.');
     },
     async (ctx) => {
         if (ctx.message && 'text' in ctx.message) {
+            if (ctx.message.text === '🔙 Back to Main') {
+                await ctx.reply('🏠 Main Menu', mainKeyboard);
+                return ctx.scene.leave();
+            }
             const stopLoss = parseFloat(ctx.message.text);
             if (isNaN(stopLoss) || stopLoss < 0) {
                 await ctx.reply('❌ Invalid stop loss. Please enter a positive number.');
                 return;
             }
             ctx.session.stopLoss = stopLoss; // Store in session
-            await ctx.reply('Please enter the take profit percentage (e.g., 200 for 200% profit):');
+            await ctx.reply('Please enter the take profit percentage (e.g., 200 for 200% profit):',
+                Markup.keyboard([
+                    ['🔙 Back to Main']
+                ]).resize()
+            );
             return ctx.wizard.next();
         }
         await ctx.reply('Please enter a valid stop loss.');
     },
     async (ctx) => {
         if (ctx.message && 'text' in ctx.message) {
+            if (ctx.message.text === '🔙 Back to Main') {
+                await ctx.reply('🏠 Main Menu', mainKeyboard);
+                return ctx.scene.leave();
+            }
             const takeProfit = parseFloat(ctx.message.text);
             if (isNaN(takeProfit) || takeProfit < 0) {
                 await ctx.reply('❌ Invalid take profit. Please enter a positive number.');
@@ -1061,50 +1093,82 @@ stage.register(configWizard);
 const paperTradingConfigWizard = new Scenes.WizardScene<MyContext>(
     'paperTradingConfigWizard',
     async (ctx) => {
-        await ctx.reply('📊 Paper Trading Configuration\n\nPlease enter the amount you want to invest per token (e.g., 0.01 for 0.01 ETH/BNB/SOL):');
+        await ctx.reply('📊 Paper Trading Configuration\n\nPlease enter the amount you want to invest per token (e.g., 0.01 for 0.01 ETH/BNB/SOL):',
+            Markup.keyboard([
+                ['🔙 Back to Main']
+            ]).resize()
+        );
         return ctx.wizard.next();
     },
     async (ctx) => {
         if (ctx.message && 'text' in ctx.message) {
+            if (ctx.message.text === '🔙 Back to Main') {
+                await ctx.reply('🏠 Main Menu', mainKeyboard);
+                return ctx.scene.leave();
+            }
             const amount = parseFloat(ctx.message.text);
             if (isNaN(amount) || amount <= 0) {
                 await ctx.reply('❌ Invalid amount. Please enter a positive number.');
                 return;
             }
             ctx.session.amount = amount;
-            await ctx.reply('Please enter the slippage percentage (e.g., 10 for 10%):');
+            await ctx.reply('Please enter the slippage percentage (e.g., 10 for 10%):',
+                Markup.keyboard([
+                    ['🔙 Back to Main']
+                ]).resize()
+            );
             return ctx.wizard.next();
         }
         await ctx.reply('Please enter a valid amount.');
     },
     async (ctx) => {
         if (ctx.message && 'text' in ctx.message) {
+            if (ctx.message.text === '🔙 Back to Main') {
+                await ctx.reply('🏠 Main Menu', mainKeyboard);
+                return ctx.scene.leave();
+            }
             const slippage = parseFloat(ctx.message.text);
             if (isNaN(slippage) || slippage < 0 || slippage > 100) {
                 await ctx.reply('❌ Invalid slippage. Please enter a number between 0 and 100.');
                 return;
             }
             ctx.session.slippage = slippage;
-            await ctx.reply('Please enter the stop loss percentage (e.g., 20 for 20% loss):');
+            await ctx.reply('Please enter the stop loss percentage (e.g., 20 for 20% loss):',
+                Markup.keyboard([
+                    ['🔙 Back to Main']
+                ]).resize()
+            );
             return ctx.wizard.next();
         }
         await ctx.reply('Please enter a valid slippage.');
     },
     async (ctx) => {
         if (ctx.message && 'text' in ctx.message) {
+            if (ctx.message.text === '🔙 Back to Main') {
+                await ctx.reply('🏠 Main Menu', mainKeyboard);
+                return ctx.scene.leave();
+            }
             const stopLoss = parseFloat(ctx.message.text);
             if (isNaN(stopLoss) || stopLoss < 0) {
                 await ctx.reply('❌ Invalid stop loss. Please enter a positive number.');
                 return;
             }
             ctx.session.stopLoss = stopLoss;
-            await ctx.reply('Please enter the take profit percentage (e.g., 200 for 200% profit):');
+            await ctx.reply('Please enter the take profit percentage (e.g., 200 for 200% profit):',
+                Markup.keyboard([
+                    ['🔙 Back to Main']
+                ]).resize()
+            );
             return ctx.wizard.next();
         }
         await ctx.reply('Please enter a valid stop loss.');
     },
     async (ctx) => {
         if (ctx.message && 'text' in ctx.message) {
+            if (ctx.message.text === '🔙 Back to Main') {
+                await ctx.reply('🏠 Main Menu', mainKeyboard);
+                return ctx.scene.leave();
+            }
             const takeProfit = parseFloat(ctx.message.text);
             if (isNaN(takeProfit) || takeProfit < 0) {
                 await ctx.reply('❌ Invalid take profit. Please enter a positive number.');

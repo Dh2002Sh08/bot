@@ -51,6 +51,9 @@ export class PaperTradeBot {
     private paperTradedTokens: Map<number, TokenData[]> = new Map(); // Track paper traded tokens per user
     private positionMonitoringIntervals: Map<number, NodeJS.Timeout> = new Map();
     private lastPriceLogs: Map<string, number> = new Map();
+    private activeUsers: Set<number> = new Set(); // Track active users
+    private activeStatusIntervals: Map<number, NodeJS.Timeout> = new Map(); // Track status message intervals
+    private solanaPriceCache: Map<string, number> = new Map(); // Cache for SOL token prices
 
     // Dummy coin amounts for paper trading
     private readonly DUMMY_BALANCES = {
@@ -104,8 +107,9 @@ export class PaperTradeBot {
                 ageSeconds: tokenData.ageSeconds
             });
 
-            // Send token detection message to ALL users who have configurations immediately
+            // Only send token detection to active users
             for (const [userId, userConfig] of this.userConfigs) {
+                if (!this.activeUsers.has(userId)) continue;
                 console.log(`📱 Processing paper trade for user ${userId}`);
                 
                 await this.botConfig.onLog(
@@ -147,7 +151,7 @@ export class PaperTradeBot {
                 await this.botConfig.onLog(`🔍 Paper Trade Validation: ${validationMessage}`, userId);
 
                 // Only attempt to paper trade if user has a paper wallet for this network AND token is valid
-                if (isValid && this.hasUserWallet(userId, tokenData.network)) {
+                if ((tokenData.network === 'SOL' && this.hasUserWallet(userId, 'SOL')) || (isValid && this.hasUserWallet(userId, tokenData.network))) {
                     console.log(`🚀 Attempting paper trade for ${tokenData.symbol} for user ${userId}`);
                     await this.attemptPaperTrade(userId, tokenData);
                 } else if (!this.hasUserWallet(userId, tokenData.network)) {
@@ -371,13 +375,27 @@ export class PaperTradeBot {
 
             console.log(`✅ Proceeding with paper trade simulation...`);
 
-            // Fetch real price from DexScreener instead of using random price
-            const realPrice = await this.getCurrentTokenPrice(tokenData.address, tokenData.network);
-            if (!realPrice) {
-                await this.botConfig.onLog(`❌ Could not fetch real price for ${tokenData.symbol} on ${tokenData.network}. Skipping paper trade.`, userId);
+            // Fetch real price from DexScreener, with retry for Solana
+            let realPrice = await this.getCurrentTokenPrice(tokenData.address, tokenData.network);
+            if (tokenData.network === 'SOL' && (!realPrice || realPrice === 0)) {
+                let retries = 2;
+                while ((!realPrice || realPrice === 0) && retries > 0) {
+                    console.log(`🔄 Retrying DexScreener price for SOL token: ${tokenData.address} (${tokenData.symbol})...`);
+                    await new Promise(res => setTimeout(res, 3000)); // Wait 3 seconds
+                    realPrice = await this.getCurrentTokenPrice(tokenData.address, tokenData.network);
+                    retries--;
+                }
+            }
+            if (!realPrice || realPrice === 0) {
+                await this.botConfig.onLog(`❌ Could not fetch real price for ${tokenData.symbol} on ${tokenData.network} after multiple attempts. Skipping paper trade.`, userId);
                 return;
             }
             const entryPrice = realPrice;
+            
+            // Cache the entry price for Solana tokens
+            if (tokenData.network === 'SOL') {
+                this.solanaPriceCache.set(tokenData.address, entryPrice);
+            }
             
             // Calculate token amount based on userConfig.amount, but cap it if paper balance is too low for simulation
             const amountToUse = Math.min(userConfig.amount, wallet.balance);
@@ -599,6 +617,7 @@ export class PaperTradeBot {
             return;
         }
 
+        this.activeUsers.add(userId); // Mark user as active
         const hasEthWallet = this.hasUserWallet(userId, 'ETH');
         const hasBscWallet = this.hasUserWallet(userId, 'BSC');
         const hasSolWallet = this.hasUserWallet(userId, 'SOL');
@@ -670,6 +689,20 @@ export class PaperTradeBot {
         // Start position monitoring
         this.startPositionMonitoring(userId);
 
+        // Send periodic status message every 5 minutes
+        const statusInterval = setInterval(async () => {
+            if (!this.activeUsers.has(userId)) {
+                clearInterval(statusInterval);
+                this.activeStatusIntervals.delete(userId);
+                return;
+            }
+            await this.sendActiveStatusMessage(userId);
+        }, 5 * 60 * 1000); // 5 minutes
+        this.activeStatusIntervals.set(userId, statusInterval);
+
+        // Also send the first status message immediately
+        await this.sendActiveStatusMessage(userId);
+
         await this.botConfig.onLog('✅ Paper Trading Bot is now running!\n\n' +
             '📊 Status:\n' +
             `🔷 ETH: ${ethActive ? '✅' : '❌'}\n` +
@@ -684,6 +717,7 @@ export class PaperTradeBot {
         this.isRunning = false;
         this.stopFlag = true;
 
+        this.activeUsers.delete(userId); // Remove user from active set
         const monitoringInterval = this.monitoringIntervals.get(userId);
         if (monitoringInterval) {
             clearInterval(monitoringInterval);
@@ -708,6 +742,13 @@ export class PaperTradeBot {
         // Stop enhanced token scanner if no other users are monitoring
         if (this.monitoringIntervals.size === 0 && this.enhancedTokenScanner) {
             this.enhancedTokenScanner.stopScanning();
+        }
+
+        // Clear periodic status message
+        const statusInterval = this.activeStatusIntervals.get(userId);
+        if (statusInterval) {
+            clearInterval(statusInterval);
+            this.activeStatusIntervals.delete(userId);
         }
 
         this.botConfig.onLog('🛑 Paper Trading Bot stopped.', userId);
@@ -867,7 +908,8 @@ export class PaperTradeBot {
                 `📈 Percentage: ${profitLossPercent >= 0 ? '+' : ''}${profitLossPercent.toFixed(2)}%\n` +
                 `🎯 Entry: $${position.entryPrice.toFixed(6)} → Exit: $${position.currentPrice.toFixed(6)}\n` +
                 `💼 New Balance: ${wallet.balance.toFixed(4)} ${network === 'ETH' ? 'ETH' : network === 'BSC' ? 'BNB' : 'SOL'}`,
-                userId);
+                userId
+            );
 
         } catch (error) {
             console.error('Error simulating sell:', error);
@@ -978,9 +1020,13 @@ export class PaperTradeBot {
     private async checkPaperPositionPrice(userId: number, network: 'ETH' | 'BSC' | 'SOL', tokenAddress: string, position: PaperTokenPosition) {
         try {
             // Get current price from DexScreener
-            const currentPrice = await this.getCurrentTokenPrice(tokenAddress, network);
-            if (currentPrice === null) {
-                return; // Skip if price couldn't be fetched
+            let currentPrice = await this.getCurrentTokenPrice(tokenAddress, network, userId);
+            // For Solana, if price fetch fails, use cached price
+            if (network === 'SOL' && (currentPrice === null || currentPrice === undefined)) {
+                currentPrice = this.solanaPriceCache.get(tokenAddress) || position.entryPrice;
+            }
+            if (currentPrice === null || currentPrice === undefined) {
+                return; // Skip if price couldn't be fetched and no cache
             }
 
             // Update position with current price
@@ -1032,6 +1078,11 @@ export class PaperTradeBot {
             const wallet = this.getUserWallet(userId, network);
             if (!wallet) return;
 
+            // Remove cached price for Solana tokens
+            if (network === 'SOL') {
+                this.solanaPriceCache.delete(tokenAddress);
+            }
+
             // Update position status
             position.status = reason === 'TAKE_PROFIT' ? 'SOLD' : 'STOPPED';
             position.currentPrice = position.currentPrice;
@@ -1067,7 +1118,7 @@ export class PaperTradeBot {
     }
 
     // Get current token price from DexScreener
-    private async getCurrentTokenPrice(tokenAddress: string, network: 'ETH' | 'BSC' | 'SOL'): Promise<number | null> {
+    private async getCurrentTokenPrice(tokenAddress: string, network: 'ETH' | 'BSC' | 'SOL', userId?: number): Promise<number | null> {
         try {
             let url: string;
             if (network === 'SOL') {
@@ -1086,8 +1137,38 @@ export class PaperTradeBot {
             }
         } catch (error) {
             console.error(`Error fetching price for ${tokenAddress}:`, error);
+            // User-friendly notification (only if userId is provided)
+            if (userId) {
+                // Only notify once per token per session
+                if (!this.lastPriceLogs.has(`fetchfail_${userId}_${tokenAddress}`)) {
+                    this.botConfig.onLog(
+                        `⚠️ Could not fetch price for token (${tokenAddress}) on ${network}. The price API may be down or unreachable. Skipping this token for now.`,
+                        userId
+                    );
+                    this.lastPriceLogs.set(`fetchfail_${userId}_${tokenAddress}`, Date.now());
+                }
+            }
             return null;
         }
+    }
+
+    // Send periodic status message every 5 minutes
+    private async sendActiveStatusMessage(userId: number) {
+        // Determine active networks
+        const ethWallet = this.getUserWallet(userId, 'ETH');
+        const bscWallet = this.getUserWallet(userId, 'BSC');
+        const solWallet = this.getUserWallet(userId, 'SOL');
+        const ethActive = ethWallet && (ethWallet as any).isActive !== false;
+        const bscActive = bscWallet && (bscWallet as any).isActive !== false;
+        const solActive = solWallet && (solWallet as any).isActive !== false;
+        const activeNetworks = [];
+        if (ethActive) activeNetworks.push('ETH');
+        if (bscActive) activeNetworks.push('BSC');
+        if (solActive) activeNetworks.push('SOL');
+        await this.botConfig.onLog(
+            `🤖 Paper Trading Bot is ACTIVE and searching for tokens on: ${activeNetworks.length > 0 ? activeNetworks.join(', ') : 'None'}`,
+            userId
+        );
     }
 
     // Activate or deactivate a paper wallet for a user and network
@@ -1095,5 +1176,29 @@ export class PaperTradeBot {
         const wallet = this.getUserWallet(userId, network);
         if (!wallet) return;
         (wallet as any).isActive = active;
+
+        // If the bot is running for this user, update the scanner's networks
+        if (this.isRunning && this.activeUsers.has(userId) && this.enhancedTokenScanner) {
+            // Determine which networks should be scanned now
+            const ethWallet = this.getUserWallet(userId, 'ETH');
+            const bscWallet = this.getUserWallet(userId, 'BSC');
+            const solWallet = this.getUserWallet(userId, 'SOL');
+            const ethActive = ethWallet && (ethWallet as any).isActive !== false;
+            const bscActive = bscWallet && (bscWallet as any).isActive !== false;
+            const solActive = solWallet && (solWallet as any).isActive !== false;
+            const networksToScan: ('ETH' | 'BSC' | 'SOL')[] = [];
+            if (ethActive) networksToScan.push('ETH');
+            if (bscActive) networksToScan.push('BSC');
+            if (solActive) networksToScan.push('SOL');
+            // Restart the scanner with the new set of networks
+            if (this.enhancedTokenScanner.isScanning()) {
+                this.enhancedTokenScanner.stopScanning();
+            }
+            if (networksToScan.length > 0) {
+                this.enhancedTokenScanner.startScanning(networksToScan);
+            }
+        }
+        // Immediately update the status message
+        this.sendActiveStatusMessage(userId);
     }
 }

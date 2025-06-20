@@ -40,6 +40,9 @@ const startBot = async (retryCount = 0) => {
         // Launch the bot
         await telegramBot_1.bot.launch();
         console.log('Bot started successfully');
+        // Initialize and start enhanced token scanners for both bots
+        await telegramBot_1.sniperBot.initializeEnhancedTokenScanner();
+        await telegramBot_1.paperTradeBot.initializeEnhancedTokenScanner();
         console.log('Available networks:');
         console.log('🟡 BSC');
         console.log('🔷 ETH');

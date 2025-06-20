@@ -192,6 +192,8 @@ export class EnhancedTokenScanner {
     private processedTokens: Set<string> = new Set(); // Track processed tokens to avoid duplicates
     private dexScreenerCache: Map<string, { data: TokenData; timestamp: number }> = new Map(); // Cache DexScreener responses
     private readonly CACHE_DURATION = 30000; // 30 seconds cache duration
+    private isSnipeScanActive: boolean = false; // Solana snipe scan state
+    private solanaSnipeInterval: NodeJS.Timeout | null = null;
 
     constructor(
         validationCriteria: TokenValidationCriteria,
@@ -321,6 +323,12 @@ export class EnhancedTokenScanner {
     // Stop scanning
     async stopScanning() {
         this.isRunning = false;
+        // Stop Solana snipe scan interval if running
+        if (this.solanaSnipeInterval) {
+            clearInterval(this.solanaSnipeInterval);
+            this.solanaSnipeInterval = null;
+            this.isSnipeScanActive = false;
+        }
 
         // Unsubscribe from all networks
         for (const [network, subscription] of this.subscriptions) {
@@ -476,6 +484,17 @@ export class EnhancedTokenScanner {
     // Solana Scanning (exact logic from solTokenScan.js)
     private async startSolanaScanning() {
         try {
+            // Start snipe scan interval (5s scan, 3s pause)
+            if (!this.solanaSnipeInterval) {
+                this.isSnipeScanActive = true;
+                this.solanaSnipeInterval = setInterval(() => {
+                    this.isSnipeScanActive = true;
+                    setTimeout(() => {
+                        this.isSnipeScanActive = false;
+                    }, 5000); // 5s scan, then pause
+                }, 8000); // 8s total (5s scan, 3s pause)
+            }
+            this.isSnipeScanActive = true; // Start active
             console.log('🔌 Subscribing to Raydium pool creation events...');
 
             const raydiumProgramId = new PublicKey(NETWORK_CONFIGS.SOL.raydiumProgram);
@@ -484,10 +503,36 @@ export class EnhancedTokenScanner {
             const subscriptionId = this.solanaConnection!.onProgramAccountChange(
                 raydiumProgramId,
                 async (info) => {
+                    if (!this.isSnipeScanActive) {
+                        // Skip detection during pause
+                        return;
+                    }
                     try {
                         const poolAddress = info.accountId.toBase58();
-                        const enriched = await this.enrichToken(poolAddress);
-                        if (enriched) {
+                        // Enhanced: Try to fetch price, poll if not available
+                        let enriched = await this.enrichToken(poolAddress);
+                        let attempt = 1;
+                        const maxAttempts = 10;
+                        while ((!enriched || !enriched.price) && attempt <= maxAttempts) {
+                            console.log(`[Polling] Attempt ${attempt}: Price not available for pool ${poolAddress}, retrying in 3s...`);
+                            await new Promise(res => setTimeout(res, 3000));
+                            enriched = await this.enrichToken(poolAddress);
+                            attempt++;
+                        }
+                        if (!enriched || !enriched.price) {
+                            // If DexScreener fails, try cache
+                            const cacheKey = `SOL_ENRICH_${poolAddress}`;
+                            const cachedData = this.dexScreenerCache.get(cacheKey);
+                            if (cachedData && cachedData.data.price) {
+                                enriched = cachedData.data;
+                                console.log(`[CACHE] Used cached enriched data for pool: ${poolAddress}`);
+                            } else {
+                                console.log(`[ERROR] No DexScreener or cache price data for pool: ${poolAddress}`);
+                            }
+                        } else {
+                            console.log(`[DEXSCREENER] Fetched price for pool: ${poolAddress}`);
+                        }
+                        if (enriched && enriched.price) {
                             this.tokenList.unshift(enriched);
                             if (this.tokenList.length > 50) this.tokenList.pop(); // Limit to 50 pools
                             console.log('🆕 New Raydium Pool Detected!');
@@ -498,7 +543,7 @@ export class EnhancedTokenScanner {
                             // Process the detected token
                             await this.processSolanaPool(poolAddress, enriched);
                         } else {
-                            console.log('Invalid pool detected');
+                            console.log('Invalid pool detected or price unavailable after polling.');
                         }
                     } catch (err) {
                         console.log('Invalid pool detected');
@@ -617,10 +662,9 @@ export class EnhancedTokenScanner {
             console.log(`🔍 Processing new SOL pool: ${poolAddress}`);
             console.log(`🚀 TOKEN DETECTION STARTED - Checking for honeypot and validating coin...`);
             
+            // Fetch price from DexScreener, fallback to cache if needed
             let tokenData: TokenData | null = null;
-
             if (enrichedData) {
-                // Use enriched data if available (from solTokenScan.js)
                 tokenData = {
                     address: enrichedData.mint,
                     symbol: enrichedData.symbol,
@@ -636,11 +680,27 @@ export class EnhancedTokenScanner {
                     timestamp: Date.now(),
                     scannerCriteria: this.validationCriteria
                 };
+                // If price is 0, try cache
+                if (!tokenData.price) {
+                    const cacheKey = `SOL_${poolAddress}`;
+                    const cachedData = this.dexScreenerCache.get(cacheKey);
+                    if (cachedData) {
+                        tokenData.price = cachedData.data.price;
+                    }
+                }
                 console.log(`📊 Using enriched data for ${tokenData.symbol}`);
             } else {
                 // Fallback to DexScreener API - remove delay for instant alert
                 console.log(`📊 Fetching data from DexScreener for pool: ${poolAddress}`);
                 tokenData = await this.getSolanaTokenData(poolAddress);
+                // If still no price, try cache
+                if (tokenData && !tokenData.price) {
+                    const cacheKey = `SOL_${poolAddress}`;
+                    const cachedData = this.dexScreenerCache.get(cacheKey);
+                    if (cachedData) {
+                        tokenData.price = cachedData.data.price;
+                    }
+                }
             }
             
             if (!tokenData) {

@@ -600,7 +600,7 @@ export class SniperBot {
             });
         }
 
-        this.botConfig.onLog('🔍 Enhanced Token Scanner is now monitoring for new tokens with validation criteria:\n' +
+        this.botConfig.onLog('🔍 Token Scanner is now monitoring for new tokens with validation criteria:\n' +
             `💧 Min Liquidity: $${this.userValidationCriteria.get(userId)?.minLiquidity || 100}\n` +
             `📊 Min Volume: $${this.userValidationCriteria.get(userId)?.minVolume || 1}\n` +
             `✅ DexScreener Required: ${this.userValidationCriteria.get(userId)?.requireDexScreener || true}\n\n` +

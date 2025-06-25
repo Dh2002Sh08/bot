@@ -386,8 +386,8 @@ export class PaperTradeBot {
                     retries--;
                 }
             }
-            if (!realPrice || realPrice === 0) {
-                await this.botConfig.onLog(`❌ Could not fetch real price for ${tokenData.symbol} on ${tokenData.network} after multiple attempts. Skipping paper trade.`, userId);
+            if (!realPrice || realPrice < 0.00001) {
+                await this.botConfig.onLog(`❌ Entry price too low ($${realPrice}). Skipping paper trade for ${tokenData.symbol}.`, userId);
                 return;
             }
             const entryPrice = realPrice;
@@ -397,15 +397,15 @@ export class PaperTradeBot {
                 this.solanaPriceCache.set(tokenData.address, entryPrice);
             }
             
+            const beforeBalance = wallet.balance;
             // Calculate token amount based on userConfig.amount, but cap it if paper balance is too low for simulation
             const amountToUse = Math.min(userConfig.amount, wallet.balance);
             const tokenAmount = amountToUse / entryPrice;
+            wallet.balance -= amountToUse;
+            console.log(`[PAPER TRADE BUY] User ${userId} ${tokenData.network} balance before: ${beforeBalance}, after: ${wallet.balance}, invested: ${amountToUse}`);
             
             console.log(`📊 Paper trade calculation: Amount to use: ${amountToUse}, Token amount: ${tokenAmount}, Entry price: $${entryPrice}`);
             
-            // Deduct from wallet balance (only the amount actually used in simulation)
-            wallet.balance -= amountToUse;
-
             // Create paper trading position
             const position: PaperTokenPosition = {
                 tokenAddress: tokenData.address,
@@ -716,42 +716,38 @@ export class PaperTradeBot {
     stopPaperTrading(userId: number) {
         this.isRunning = false;
         this.stopFlag = true;
-
         this.activeUsers.delete(userId); // Remove user from active set
         const monitoringInterval = this.monitoringIntervals.get(userId);
         if (monitoringInterval) {
             clearInterval(monitoringInterval);
             this.monitoringIntervals.delete(userId);
+            console.log(`[STOP] Cleared monitoring interval for user ${userId}`);
         }
-
         const balanceInterval = this.balanceUpdateIntervals.get(userId);
         if (balanceInterval) {
             clearInterval(balanceInterval);
             this.balanceUpdateIntervals.delete(userId);
+            console.log(`[STOP] Cleared balance interval for user ${userId}`);
         }
-
         const priceInterval = this.priceUpdateIntervals.get(userId);
         if (priceInterval) {
             clearInterval(priceInterval);
             this.priceUpdateIntervals.delete(userId);
+            console.log(`[STOP] Cleared price interval for user ${userId}`);
         }
-
-        // Stop position monitoring
         this.stopPositionMonitoring(userId);
-
-        // Stop enhanced token scanner if no other users are monitoring
-        if (this.monitoringIntervals.size === 0 && this.enhancedTokenScanner) {
+        if (this.enhancedTokenScanner) {
             this.enhancedTokenScanner.stopScanning();
+            console.log('[STOP] Called enhancedTokenScanner.stopScanning() from stopPaperTrading');
         }
-
-        // Clear periodic status message
         const statusInterval = this.activeStatusIntervals.get(userId);
         if (statusInterval) {
             clearInterval(statusInterval);
             this.activeStatusIntervals.delete(userId);
+            console.log(`[STOP] Cleared status interval for user ${userId}`);
         }
-
         this.botConfig.onLog('🛑 Paper Trading Bot stopped.', userId);
+        console.log(`[STOP] Paper trading stopped for user ${userId}`);
     }
 
     // Monitor for new tokens to snipe
@@ -800,8 +796,8 @@ export class PaperTradeBot {
 
             // Fetch real price from DexScreener instead of using random price
             const realPrice = await this.getCurrentTokenPrice(tokenAddress, network);
-            if (!realPrice) {
-                await this.botConfig.onLog(`❌ Could not fetch real price for ${tokenSymbol} on ${network}. Skipping paper trade.`, userId);
+            if (!realPrice || realPrice < 0.00001) {
+                await this.botConfig.onLog(`❌ Entry price too low ($${realPrice}). Skipping paper trade for ${tokenSymbol}.`, userId);
                 return;
             }
             const entryPrice = realPrice;
@@ -892,15 +888,28 @@ export class PaperTradeBot {
             const profitLossPercent = ((position.currentPrice - position.entryPrice) / position.entryPrice) * 100;
 
             // Add back to wallet balance
+            const beforeSellBalance = wallet.balance;
             const sellAmount = position.amount * position.currentPrice;
             wallet.balance += sellAmount;
+            console.log(`[PAPER TRADE SELL] User ${userId} ${network} balance before: ${beforeSellBalance}, after: ${wallet.balance}, proceeds: ${sellAmount}`);
 
-            // Mark position as sold
-            position.status = 'SOLD';
+            // Update position status
+            position.status = reason === 'TAKE_PROFIT' ? 'SOLD' : 'STOPPED';
+            position.currentPrice = position.currentPrice;
+            wallet.tokens.set(tokenAddress, position);
+            // Remove position from wallet after selling
+            wallet.tokens.delete(tokenAddress);
 
             const emoji = profitLoss >= 0 ? '✅' : '❌';
             const reasonText = reason === 'STOP_LOSS' ? 'Stop Loss' : 
                              reason === 'TAKE_PROFIT' ? 'Take Profit' : 'Manual Sell';
+
+            if (position.entryPrice < 0.00001) {
+                await this.botConfig.onLog(`❌ Invalid entry price for ${position.tokenSymbol}. Skipping P&L calculation.`, userId);
+                // Remove position from wallet after selling
+                wallet.tokens.delete(tokenAddress);
+                return;
+            }
 
             await this.botConfig.onLog(`${emoji} Paper Trading: Sold ${position.tokenSymbol}!\n` +
                 `📊 Reason: ${reasonText}\n` +
@@ -1087,14 +1096,18 @@ export class PaperTradeBot {
             position.status = reason === 'TAKE_PROFIT' ? 'SOLD' : 'STOPPED';
             position.currentPrice = position.currentPrice;
             wallet.tokens.set(tokenAddress, position);
+            // Remove position from wallet after selling
+            wallet.tokens.delete(tokenAddress);
 
             // Calculate profit/loss
             const profitLoss = priceChange;
             const profitLossUSD = (position.amount * profitLoss) / 100;
 
             // Add back to wallet balance
+            const beforeSellBalance = wallet.balance;
             const sellAmount = position.amount * position.currentPrice;
             wallet.balance += sellAmount;
+            console.log(`[PAPER TRADE SELL] User ${userId} ${network} balance before: ${beforeSellBalance}, after: ${wallet.balance}, proceeds: ${sellAmount}`);
 
             const emoji = reason === 'TAKE_PROFIT' ? '🎯' : '🛑';
             const reasonText = reason === 'TAKE_PROFIT' ? 'Take Profit Reached!' : 'Stop Loss Triggered!';
@@ -1122,14 +1135,13 @@ export class PaperTradeBot {
         try {
             let url: string;
             if (network === 'SOL') {
+                // Use mint address for Solana
                 url = `https://api.dexscreener.com/latest/dex/pairs/solana/${tokenAddress}`;
             } else {
                 url = `https://api.dexscreener.com/latest/dex/tokens/${tokenAddress}`;
             }
-
             const response = await fetch(url);
             const data = await response.json() as any;
-
             if (network === 'SOL') {
                 return data.pair ? parseFloat(data.pair.priceUsd) : null;
             } else {
@@ -1141,10 +1153,10 @@ export class PaperTradeBot {
             if (userId) {
                 // Only notify once per token per session
                 if (!this.lastPriceLogs.has(`fetchfail_${userId}_${tokenAddress}`)) {
-                    this.botConfig.onLog(
-                        `⚠️ Could not fetch price for token (${tokenAddress}) on ${network}. The price API may be down or unreachable. Skipping this token for now.`,
-                        userId
-                    );
+                    // this.botConfig.onLog(
+                    //     `⚠️ Could not fetch price for token (${tokenAddress}) on ${network}. The price API may be down or unreachable. Skipping this token for now.`,
+                    //     userId
+                    // );
                     this.lastPriceLogs.set(`fetchfail_${userId}_${tokenAddress}`, Date.now());
                 }
             }
@@ -1200,5 +1212,31 @@ export class PaperTradeBot {
         }
         // Immediately update the status message
         this.sendActiveStatusMessage(userId);
+    }
+
+    // Force stop all paper trading and scanner for all users
+    forceStopAll() {
+        this.isRunning = false;
+        this.stopFlag = true;
+        for (const userId of Array.from(this.activeUsers)) {
+            this.stopPaperTrading(userId);
+        }
+        this.activeUsers.clear();
+        if (this.enhancedTokenScanner) {
+            this.enhancedTokenScanner.stopScanning();
+            console.log('[FORCE STOP] Called enhancedTokenScanner.stopScanning() from forceStopAll');
+        }
+        // Clear all intervals just in case
+        for (const interval of this.monitoringIntervals.values()) clearInterval(interval);
+        for (const interval of this.balanceUpdateIntervals.values()) clearInterval(interval);
+        for (const interval of this.priceUpdateIntervals.values()) clearInterval(interval);
+        for (const interval of this.positionMonitoringIntervals.values()) clearInterval(interval);
+        for (const interval of this.activeStatusIntervals.values()) clearInterval(interval);
+        this.monitoringIntervals.clear();
+        this.balanceUpdateIntervals.clear();
+        this.priceUpdateIntervals.clear();
+        this.positionMonitoringIntervals.clear();
+        this.activeStatusIntervals.clear();
+        console.log('[FORCE STOP] All intervals and scanner stopped.');
     }
 }

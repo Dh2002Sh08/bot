@@ -194,6 +194,7 @@ export class EnhancedTokenScanner {
     private readonly CACHE_DURATION = 30000; // 30 seconds cache duration
     private isSnipeScanActive: boolean = false; // Solana snipe scan state
     private solanaSnipeInterval: NodeJS.Timeout | null = null;
+    private solanaPoolQueue: string[] = [];
 
     constructor(
         validationCriteria: TokenValidationCriteria,
@@ -328,6 +329,8 @@ export class EnhancedTokenScanner {
             clearInterval(this.solanaSnipeInterval);
             this.solanaSnipeInterval = null;
             this.isSnipeScanActive = false;
+            this.solanaPoolQueue = [];
+            console.log('[STOP] Cleared solanaSnipeInterval in EnhancedTokenScanner');
         }
 
         // Unsubscribe from all networks
@@ -345,7 +348,7 @@ export class EnhancedTokenScanner {
 
         this.subscriptions.clear();
         this.activeNetworks.clear();
-        console.log('🛑 Enhanced Token Scanner stopped');
+        console.log('[STOP] Called stopScanning in EnhancedTokenScanner');
     }
 
     // Update validation criteria
@@ -484,15 +487,63 @@ export class EnhancedTokenScanner {
     // Solana Scanning (exact logic from solTokenScan.js)
     private async startSolanaScanning() {
         try {
-            // Start snipe scan interval (5s scan, 3s pause)
+            // Start snipe scan interval (2s scan, 3s pause)
             if (!this.solanaSnipeInterval) {
                 this.isSnipeScanActive = true;
-                this.solanaSnipeInterval = setInterval(() => {
+                this.solanaSnipeInterval = setInterval(async () => {
                     this.isSnipeScanActive = true;
-                    setTimeout(() => {
+                    // Active for 2s: collect pools
+                    setTimeout(async () => {
                         this.isSnipeScanActive = false;
-                    }, 5000); // 5s scan, then pause
-                }, 8000); // 8s total (5s scan, 3s pause)
+                        // Pause for 3s: process queued pools
+                        const poolsToProcess = [...this.solanaPoolQueue];
+                        this.solanaPoolQueue = [];
+                        for (const poolAddress of poolsToProcess) {
+                            try {
+                                let enriched = await this.enrichToken(poolAddress);
+                                let attempt = 1;
+                                const maxAttempts = 10;
+                                // If enrichToken returns data, get the mint address from it
+                                let mintAddress = enriched && enriched.mint ? enriched.mint : poolAddress;
+                                // Always use mintAddress for price polling
+                                while ((!enriched || !enriched.price) && attempt <= maxAttempts) {
+                                    console.log(`[Polling] Attempt ${attempt}: Price not available for mint ${mintAddress}, retrying in 3s...`);
+                                    await new Promise(res => setTimeout(res, 3000));
+                                    enriched = await this.enrichToken(mintAddress);
+                                    attempt++;
+                                }
+                                if (!enriched || !enriched.price) {
+                                    // If DexScreener fails, try cache
+                                    const cacheKey = `SOL_ENRICH_${mintAddress}`;
+                                    const cachedData = this.dexScreenerCache.get(cacheKey);
+                                    if (cachedData && cachedData.data.price) {
+                                        enriched = cachedData.data;
+                                        console.log(`[CACHE] Used cached enriched data for mint: ${mintAddress}`);
+                                    } else {
+                                        console.log(`[ERROR] No DexScreener or cache price data for mint: ${mintAddress}`);
+                                    }
+                                } else {
+                                    console.log(`[DEXSCREENER] Fetched price for mint: ${mintAddress}`);
+                                }
+                                if (enriched && enriched.price) {
+                                    this.tokenList.unshift(enriched);
+                                    if (this.tokenList.length > 50) this.tokenList.pop(); // Limit to 50 pools
+                                    console.log('🆕 New Raydium Pool Detected!');
+                                    console.log('Mint Address:', mintAddress);
+                                    console.log('Timestamp:', new Date().toISOString());
+                                    console.log('Enriched Pool Data:', enriched);
+                                    await this.processSolanaPool(mintAddress, enriched); // Pass mint address
+                                } else {
+                                    console.log('Invalid pool detected or price unavailable after polling.');
+                                }
+                            } catch (err) {
+                                console.log('Invalid pool detected');
+                            }
+                        }
+                    }, 2000); // 2s scan, then pause and process
+                }, 5000); // 5s total (2s scan, 3s pause)
+            } else {
+                console.log('[WARN] solanaSnipeInterval already exists in startSolanaScanning');
             }
             this.isSnipeScanActive = true; // Start active
             console.log('🔌 Subscribing to Raydium pool creation events...');
@@ -509,41 +560,9 @@ export class EnhancedTokenScanner {
                     }
                     try {
                         const poolAddress = info.accountId.toBase58();
-                        // Enhanced: Try to fetch price, poll if not available
-                        let enriched = await this.enrichToken(poolAddress);
-                        let attempt = 1;
-                        const maxAttempts = 10;
-                        while ((!enriched || !enriched.price) && attempt <= maxAttempts) {
-                            console.log(`[Polling] Attempt ${attempt}: Price not available for pool ${poolAddress}, retrying in 3s...`);
-                            await new Promise(res => setTimeout(res, 3000));
-                            enriched = await this.enrichToken(poolAddress);
-                            attempt++;
-                        }
-                        if (!enriched || !enriched.price) {
-                            // If DexScreener fails, try cache
-                            const cacheKey = `SOL_ENRICH_${poolAddress}`;
-                            const cachedData = this.dexScreenerCache.get(cacheKey);
-                            if (cachedData && cachedData.data.price) {
-                                enriched = cachedData.data;
-                                console.log(`[CACHE] Used cached enriched data for pool: ${poolAddress}`);
-                            } else {
-                                console.log(`[ERROR] No DexScreener or cache price data for pool: ${poolAddress}`);
-                            }
-                        } else {
-                            console.log(`[DEXSCREENER] Fetched price for pool: ${poolAddress}`);
-                        }
-                        if (enriched && enriched.price) {
-                            this.tokenList.unshift(enriched);
-                            if (this.tokenList.length > 50) this.tokenList.pop(); // Limit to 50 pools
-                            console.log('🆕 New Raydium Pool Detected!');
-                            console.log('Pool Address:', poolAddress);
-                            console.log('Timestamp:', new Date().toISOString());
-                            console.log('Enriched Pool Data:', enriched);
-
-                            // Process the detected token
-                            await this.processSolanaPool(poolAddress, enriched);
-                        } else {
-                            console.log('Invalid pool detected or price unavailable after polling.');
+                        // Only queue the pool address, do not process yet
+                        if (!this.solanaPoolQueue.includes(poolAddress)) {
+                            this.solanaPoolQueue.push(poolAddress);
                         }
                     } catch (err) {
                         console.log('Invalid pool detected');
@@ -942,28 +961,25 @@ export class EnhancedTokenScanner {
     }
 
     // Enrich token function (exact copy from solTokenScan.js)
-    private async enrichToken(poolAddress: string) {
+    private async enrichToken(mintAddress: string) {
         try {
-            const cacheKey = `SOL_ENRICH_${poolAddress}`;
+            const cacheKey = `SOL_ENRICH_${mintAddress}`;
             const cachedData = this.dexScreenerCache.get(cacheKey);
             if (cachedData && Date.now() - cachedData.timestamp < this.CACHE_DURATION) {
                 return cachedData.data as any;
             }
-
-            const res = await fetch(`https://api.dexscreener.com/latest/dex/pairs/solana/${poolAddress}`);
+            // Use /search/?q= endpoint, which returns a 'pairs' array
+            const res = await fetch(`https://api.dexscreener.com/latest/dex/search/?q=${mintAddress}`);
             const text = await res.text();
-
             let data;
             try {
                 data = JSON.parse(text);
             } catch {
                 return null;
             }
-
-            const mintAddress = data?.pair?.baseToken?.address;
-
-            if (data && data.pair) {
-                const pair = data.pair;
+            // Check for pairs array and use the first pair
+            if (data && Array.isArray(data.pairs) && data.pairs.length > 0) {
+                const pair = data.pairs[0];
                 const enrichedData = {
                     mint: mintAddress,
                     name: pair.baseToken.name,
@@ -979,10 +995,10 @@ export class EnhancedTokenScanner {
                     timestamp: Date.now(),
                     scannerCriteria: this.validationCriteria
                 };
-
                 this.dexScreenerCache.set(cacheKey, { data: enrichedData as any, timestamp: Date.now() });
                 return enrichedData;
             }
+            // Fallback: no pairs found
             return null;
         } catch (error) {
             console.error(`Error enriching Solana token:`, error);
@@ -1035,23 +1051,19 @@ export class EnhancedTokenScanner {
     }
 
     // Get Solana token data (fallback for processSolanaPool if enrichedData is not provided)
-    private async getSolanaTokenData(poolAddress: string): Promise<TokenData | null> {
+    private async getSolanaTokenData(mintAddress: string): Promise<TokenData | null> {
         try {
-            const cacheKey = `SOL_${poolAddress}`;
+            const cacheKey = `SOL_${mintAddress}`;
             const cachedData = this.dexScreenerCache.get(cacheKey);
             if (cachedData && Date.now() - cachedData.timestamp < this.CACHE_DURATION) {
                 return cachedData.data;
             }
-
-            const response = await fetch(`${NETWORK_CONFIGS.SOL.dexScreenerBase}${poolAddress}`);
+            const response = await fetch(`https://api.dexscreener.com/latest/dex/pairs/solana/${mintAddress}`);
             const data = await response.json() as DexScreenerResponse;
-
             if (!data.pair) {
                 return null;
             }
-
             const pair = data.pair;
-            
             const tokenData: TokenData = {
                 address: pair.baseToken.address,
                 symbol: pair.baseToken.symbol,
@@ -1062,15 +1074,13 @@ export class EnhancedTokenScanner {
                 volume24h: parseFloat(pair.volume?.h24) || 0,
                 age: this.formatAge(pair.pairCreatedAt),
                 ageSeconds: Math.floor((Date.now() - pair.pairCreatedAt) / 1000),
-                pairAddress: poolAddress,
-                dexScreenerUrl: `https://dexscreener.com/solana/${poolAddress}`,
+                pairAddress: mintAddress,
+                dexScreenerUrl: `https://dexscreener.com/solana/${mintAddress}`,
                 timestamp: Date.now(),
                 scannerCriteria: this.validationCriteria
             };
-
             this.dexScreenerCache.set(cacheKey, { data: tokenData, timestamp: Date.now() });
             return tokenData;
-
         } catch (error) {
             console.error('Error fetching Solana token data:', error);
             return null;

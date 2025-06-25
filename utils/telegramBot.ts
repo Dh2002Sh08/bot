@@ -163,6 +163,7 @@ const paperWalletManagementKeyboard = Markup.keyboard([
     ['🔷 ETH Wallet', '🔷 Deactivate ETH'],
     ['🟡 BSC Wallet', '🟡 Deactivate BSC'],
     ['🟣 SOL Wallet', '🟣 Deactivate SOL'],
+    ['❌ Stop Bot'],
     ['🔙 Back to Paper Trading']
 ]).resize();
 
@@ -174,6 +175,7 @@ const paperTradingKeyboard = Markup.keyboard([
     ['🔷 Activate ETH Paper Wallet', '🔷 Deactivate ETH Paper Wallet'],
     ['🟡 Activate BSC Paper Wallet', '🟡 Deactivate BSC Paper Wallet'],
     ['🟣 Activate SOL Paper Wallet', '🟣 Deactivate SOL Paper Wallet'],
+    ['❌ Stop Bot'],
     ['🔙 Back to Main']
 ]).resize();
 

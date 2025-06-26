@@ -21,6 +21,7 @@ interface MySession extends Scenes.WizardSession {
     stopLoss?: number;
     takeProfit?: number;
     waitingFor?: string;
+    tradeLimit?: number;
 }
 
 // Define context interface
@@ -108,6 +109,7 @@ const mainKeyboard = Markup.keyboard([
     ['🔄 Start Sniper Bot', '👛 Create Wallet'],
     ['📈 User Sniped Token', '⚙️ Settings'],
     ['📊 Paper Trading', '❌ Stop Bot'],
+    ['🔢 Set Trade Limit', '🔄 Reset Trade Limit'],
     ['🔐 Recover Wallet', '/loadwallet']
 ]).resize();
 
@@ -667,8 +669,8 @@ bot.hears('🚀 Start Paper Trading', async (ctx) => {
 bot.hears('🛑 Stop Paper Trading', async (ctx) => {
     const userId = ctx.from?.id;
     if (!userId) return;
-
     paperTradeBot.stopPaperTrading(userId);
+    await ctx.reply('🛑 Paper trading stopped for all networks.', mainKeyboard);
 });
 
 // Handle Paper Trading Balance button
@@ -809,6 +811,7 @@ bot.hears('⚙️ Settings', async (ctx) => {
     const settingsKeyboard = Markup.keyboard([
         ['📊 Set Validation Criteria', '📈 View Sniped Tokens'],
         ['📊 View Paper Trading Tokens', '⚙️ Set Trading Config'],
+        ['🔢 Set Trade Limit', '🔄 Reset Trade Limit'],
         ['🔙 Back to Main']
     ]).resize();
 
@@ -925,6 +928,7 @@ bot.hears('🔙 Back to Settings', async (ctx) => {
     const settingsKeyboard = Markup.keyboard([
         ['📊 Set Validation Criteria', '📈 View Sniped Tokens'],
         ['📊 View Paper Trading Tokens', '⚙️ Set Trading Config'],
+        ['🔢 Set Trade Limit', '🔄 Reset Trade Limit'],
         ['🔙 Back to Main']
     ]).resize();
 
@@ -1052,39 +1056,63 @@ const configWizard = new Scenes.WizardScene<MyContext>(
                 await ctx.reply('❌ Invalid take profit. Please enter a positive number.');
                 return;
             }
-            ctx.session.takeProfit = takeProfit; // Store in session
+            ctx.session.takeProfit = takeProfit;
+            await ctx.reply('How many trades do you want the bot to perform? (Enter a number, e.g., 5. Enter 0 for unlimited)',
+                Markup.keyboard([
+                    ['🔙 Back to Main']
+                ]).resize()
+            );
+            return ctx.wizard.next();
+        }
+        await ctx.reply('Please enter a valid take profit.');
+    },
+    async (ctx) => {
+        if (ctx.message && 'text' in ctx.message) {
+            if (ctx.message.text === '🔙 Back to Main') {
+                await ctx.reply('🏠 Main Menu', mainKeyboard);
+                return ctx.scene.leave();
+            }
+            const tradeLimit = parseInt(ctx.message.text);
+            if (isNaN(tradeLimit) || tradeLimit < 0) {
+                await ctx.reply('❌ Invalid trade limit. Please enter a non-negative integer.');
+                return;
+            }
+            ctx.session.tradeLimit = tradeLimit;
 
             const userId = ctx.from?.id;
             if (!userId) {
                 await ctx.reply('❌ Error: Could not get user ID.');
-            return ctx.scene.leave();
-        }
+                return ctx.scene.leave();
+            }
 
-            // Update both sniper and paper trade bot configs
+            // Update paper trade bot config
             const newConfig = {
                 amount: ctx.session.amount!,
                 slippage: ctx.session.slippage!,
                 stopLoss: ctx.session.stopLoss!,
                 takeProfit: ctx.session.takeProfit!,
-                onLog: sniperBot.getLogCallback(), // Use sniper bot's log/error callbacks
-                onError: sniperBot.getErrorCallback()
+                onLog: paperTradeBot.getLogCallback(),
+                onError: paperTradeBot.getErrorCallback()
             };
 
-            sniperBot.updateUserConfig(userId, newConfig);
             paperTradeBot.updateUserConfig(userId, newConfig);
+            paperTradeBot.setUserTradeLimit(userId, tradeLimit === 0 ? Number.MAX_SAFE_INTEGER : tradeLimit);
+            sniperBot.updateUserConfig(userId, newConfig);
+            sniperBot.setUserTradeLimit(userId, tradeLimit === 0 ? Number.MAX_SAFE_INTEGER : tradeLimit);
 
-            await ctx.reply('✅ Trading configuration updated for both bots!', Markup.removeKeyboard());
+            await ctx.reply('✅ Paper Trading configuration updated!', Markup.removeKeyboard());
             await ctx.reply(
-                '📊 Current Configuration:\n\n' +
-                `Amount: ${newConfig.amount} ETH/BNB/SOL\n` +
-                `Slippage: ${newConfig.slippage}%\n` +
-                `Stop Loss: ${newConfig.stopLoss}%\n` +
-                `Take Profit: ${newConfig.takeProfit}%`,
+                '📊 Paper Trading Configuration:\n\n' +
+                `💰 Amount per token: ${newConfig.amount} ETH/BNB/SOL\n` +
+                `📊 Slippage: ${newConfig.slippage}%\n` +
+                `🛑 Stop Loss: ${newConfig.stopLoss}%\n` +
+                `🎯 Take Profit: ${newConfig.takeProfit}%\n` +
+                `🔢 Trade Limit: ${tradeLimit === 0 ? 'Unlimited' : tradeLimit}`,
                 mainKeyboard
             );
             return ctx.scene.leave();
         }
-        await ctx.reply('Please enter a valid take profit.');
+        await ctx.reply('Please enter a valid trade limit.');
     }
 );
 
@@ -1177,6 +1205,27 @@ const paperTradingConfigWizard = new Scenes.WizardScene<MyContext>(
                 return;
             }
             ctx.session.takeProfit = takeProfit;
+            await ctx.reply('How many trades do you want the bot to perform? (Enter a number, e.g., 5. Enter 0 for unlimited)',
+                Markup.keyboard([
+                    ['🔙 Back to Main']
+                ]).resize()
+            );
+            return ctx.wizard.next();
+        }
+        await ctx.reply('Please enter a valid take profit.');
+    },
+    async (ctx) => {
+        if (ctx.message && 'text' in ctx.message) {
+            if (ctx.message.text === '🔙 Back to Main') {
+                await ctx.reply('🏠 Main Menu', mainKeyboard);
+                return ctx.scene.leave();
+            }
+            const tradeLimit = parseInt(ctx.message.text);
+            if (isNaN(tradeLimit) || tradeLimit < 0) {
+                await ctx.reply('❌ Invalid trade limit. Please enter a non-negative integer.');
+                return;
+            }
+            ctx.session.tradeLimit = tradeLimit;
 
             const userId = ctx.from?.id;
             if (!userId) {
@@ -1195,19 +1244,23 @@ const paperTradingConfigWizard = new Scenes.WizardScene<MyContext>(
             };
 
             paperTradeBot.updateUserConfig(userId, newConfig);
+            paperTradeBot.setUserTradeLimit(userId, tradeLimit === 0 ? Number.MAX_SAFE_INTEGER : tradeLimit);
+            sniperBot.updateUserConfig(userId, newConfig);
+            sniperBot.setUserTradeLimit(userId, tradeLimit === 0 ? Number.MAX_SAFE_INTEGER : tradeLimit);
 
             await ctx.reply('✅ Paper Trading configuration updated!', Markup.removeKeyboard());
-        await ctx.reply(
+            await ctx.reply(
                 '📊 Paper Trading Configuration:\n\n' +
                 `💰 Amount per token: ${newConfig.amount} ETH/BNB/SOL\n` +
                 `📊 Slippage: ${newConfig.slippage}%\n` +
                 `🛑 Stop Loss: ${newConfig.stopLoss}%\n` +
-                `🎯 Take Profit: ${newConfig.takeProfit}%`,
-            mainKeyboard
-        );
-        return ctx.scene.leave();
+                `🎯 Take Profit: ${newConfig.takeProfit}%\n` +
+                `🔢 Trade Limit: ${tradeLimit === 0 ? 'Unlimited' : tradeLimit}`,
+                mainKeyboard
+            );
+            return ctx.scene.leave();
         }
-        await ctx.reply('Please enter a valid take profit.');
+        await ctx.reply('Please enter a valid trade limit.');
     }
 );
 
@@ -1566,6 +1619,10 @@ bot.hears('🔷 Deactivate ETH Paper Wallet', async (ctx) => {
     if (!userId) return;
     paperTradeBot.setPaperWalletActive(userId, 'ETH', false);
     await ctx.reply('❌ ETH Paper Wallet deactivated.', paperWalletManagementKeyboard);
+    if (!paperTradeBot.hasAnyActivePaperWallet(userId)) {
+        paperTradeBot.stopPaperTrading(userId);
+        await ctx.reply('🛑 All paper wallets deactivated. Paper trading stopped.');
+    }
 });
 bot.hears('🟡 Activate BSC Paper Wallet', async (ctx) => {
     const userId = ctx.from?.id;
@@ -1578,6 +1635,10 @@ bot.hears('🟡 Deactivate BSC Paper Wallet', async (ctx) => {
     if (!userId) return;
     paperTradeBot.setPaperWalletActive(userId, 'BSC', false);
     await ctx.reply('❌ BSC Paper Wallet deactivated.', paperWalletManagementKeyboard);
+    if (!paperTradeBot.hasAnyActivePaperWallet(userId)) {
+        paperTradeBot.stopPaperTrading(userId);
+        await ctx.reply('🛑 All paper wallets deactivated. Paper trading stopped.');
+    }
 });
 bot.hears('🟣 Activate SOL Paper Wallet', async (ctx) => {
     const userId = ctx.from?.id;
@@ -1590,7 +1651,86 @@ bot.hears('🟣 Deactivate SOL Paper Wallet', async (ctx) => {
     if (!userId) return;
     paperTradeBot.setPaperWalletActive(userId, 'SOL', false);
     await ctx.reply('❌ SOL Paper Wallet deactivated.', paperWalletManagementKeyboard);
+    if (!paperTradeBot.hasAnyActivePaperWallet(userId)) {
+        paperTradeBot.stopPaperTrading(userId);
+        await ctx.reply('🛑 All paper wallets deactivated. Paper trading stopped.');
+    }
 });
+
+// Add a command/button to reset trade limit
+bot.hears('🔄 Reset Trade Limit', async (ctx) => {
+    const userId = ctx.from?.id;
+    if (!userId) return;
+    paperTradeBot.resetUserTradesExecuted(userId);
+    sniperBot.resetUserTradesExecuted(userId);
+    await ctx.reply('✅ Trade limit counters have been reset.');
+    // Resume scanning if bot is running
+    sniperBot.startBackgroundMonitoring(userId);
+    await paperTradeBot.startPaperTrading(userId);
+});
+
+// Add handler for Set Trade Limit button
+bot.hears('🔢 Set Trade Limit', async (ctx) => {
+    const userId = ctx.from?.id;
+    if (!userId) return;
+    ctx.session.waitingFor = 'setTradeLimit';
+    await ctx.reply('Please enter the new trade limit (number of trades, 0 for unlimited):');
+});
+
+// Add a flag to session to track if waiting for trade limit increase
+// ... existing code ...
+// In both bots, when trade limit is reached, send a prompt to the user
+// Add a handler for trade limit reached prompt
+bot.action('increase_trade_limit', async (ctx) => {
+    const userId = ctx.from?.id;
+    if (!userId) return;
+    ctx.session.waitingFor = 'increaseTradeLimit';
+    await ctx.reply('How much do you want to increase the trade limit by? (Enter a number, 0 for unlimited):');
+});
+bot.action('no_increase_trade_limit', async (ctx) => {
+    await ctx.reply('Okay, scanning will remain paused. You can set a new trade limit anytime.');
+});
+// When trade limit is reached, send Yes/No prompt
+function promptTradeLimitIncrease(userId: number) {
+    bot.telegram.sendMessage(userId, '🚦 Trade limit reached. Do you want to increase the trade limit?', {
+        reply_markup: {
+            inline_keyboard: [
+                [{ text: 'Yes', callback_data: 'increase_trade_limit' }, { text: 'No', callback_data: 'no_increase_trade_limit' }]
+            ]
+        }
+    });
+}
+// Patch paperTradeBot and sniperBot to call promptTradeLimitIncrease(userId) when trade limit is reached
+// ... existing code ...
+bot.hears(/^[0-9]+$/, async (ctx) => {
+    const userId = ctx.from?.id;
+    if (!userId || !ctx.session.waitingFor) return;
+    const value = parseInt(ctx.message.text);
+    if (isNaN(value) || value < 0) {
+        await ctx.reply('❌ Invalid value. Please enter a non-negative integer.');
+        return;
+    }
+    if (ctx.session.waitingFor === 'increaseTradeLimit') {
+        paperTradeBot.setUserTradeLimit(userId, value === 0 ? Number.MAX_SAFE_INTEGER : value);
+        sniperBot.setUserTradeLimit(userId, value === 0 ? Number.MAX_SAFE_INTEGER : value);
+        ctx.session.waitingFor = undefined;
+        await ctx.reply(`✅ Trade limit updated to ${value === 0 ? 'Unlimited' : value}. Scanning will resume.`);
+        await paperTradeBot.startPaperTrading(userId);
+        sniperBot.startBackgroundMonitoring(userId);
+        return;
+    }
+    if (ctx.session.waitingFor === 'setTradeLimit') {
+        paperTradeBot.setUserTradeLimit(userId, value === 0 ? Number.MAX_SAFE_INTEGER : value);
+        sniperBot.setUserTradeLimit(userId, value === 0 ? Number.MAX_SAFE_INTEGER : value);
+        ctx.session.waitingFor = undefined;
+        await ctx.reply(`✅ Trade limit updated to ${value === 0 ? 'Unlimited' : value}. Scanning will resume.`);
+        await paperTradeBot.startPaperTrading(userId);
+        sniperBot.startBackgroundMonitoring(userId);
+        return;
+    }
+    // ... existing code for other waitingFor cases ...
+});
+// ... existing code ...
 
 // Export the bot instance
 export { bot };

@@ -491,9 +491,11 @@ export class EnhancedTokenScanner {
             if (!this.solanaSnipeInterval) {
                 this.isSnipeScanActive = true;
                 this.solanaSnipeInterval = setInterval(async () => {
+                    if (!this.isRunning) return; // Guard: do not poll if stopped
                     this.isSnipeScanActive = true;
                     // Active for 2s: collect pools
                     setTimeout(async () => {
+                        if (!this.isRunning) return; // Guard inside setTimeout as well
                         this.isSnipeScanActive = false;
                         // Pause for 3s: process queued pools
                         const poolsToProcess = [...this.solanaPoolQueue];
@@ -503,17 +505,15 @@ export class EnhancedTokenScanner {
                                 let enriched = await this.enrichToken(poolAddress);
                                 let attempt = 1;
                                 const maxAttempts = 10;
-                                // If enrichToken returns data, get the mint address from it
                                 let mintAddress = enriched && enriched.mint ? enriched.mint : poolAddress;
-                                // Always use mintAddress for price polling
                                 while ((!enriched || !enriched.price) && attempt <= maxAttempts) {
+                                    if (!this.isRunning) return;
                                     console.log(`[Polling] Attempt ${attempt}: Price not available for mint ${mintAddress}, retrying in 3s...`);
                                     await new Promise(res => setTimeout(res, 3000));
                                     enriched = await this.enrichToken(mintAddress);
                                     attempt++;
                                 }
                                 if (!enriched || !enriched.price) {
-                                    // If DexScreener fails, try cache
                                     const cacheKey = `SOL_ENRICH_${mintAddress}`;
                                     const cachedData = this.dexScreenerCache.get(cacheKey);
                                     if (cachedData && cachedData.data.price) {
@@ -527,12 +527,12 @@ export class EnhancedTokenScanner {
                                 }
                                 if (enriched && enriched.price) {
                                     this.tokenList.unshift(enriched);
-                                    if (this.tokenList.length > 50) this.tokenList.pop(); // Limit to 50 pools
+                                    if (this.tokenList.length > 50) this.tokenList.pop();
                                     console.log('🆕 New Raydium Pool Detected!');
                                     console.log('Mint Address:', mintAddress);
                                     console.log('Timestamp:', new Date().toISOString());
                                     console.log('Enriched Pool Data:', enriched);
-                                    await this.processSolanaPool(mintAddress, enriched); // Pass mint address
+                                    await this.processSolanaPool(mintAddress, enriched);
                                 } else {
                                     console.log('Invalid pool detected or price unavailable after polling.');
                                 }

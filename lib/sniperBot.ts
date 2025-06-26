@@ -96,6 +96,9 @@ export class SniperBot {
     private snipedTokens: Map<number, TokenData[]> = new Map(); // Track sniped tokens per user
     private positionMonitoringIntervals: Map<number, NodeJS.Timeout> = new Map();
     private lastPriceLogs: Map<string, number> = new Map(); // Re-trigger linter
+    private userTradeLimits: Map<number, number> = new Map(); // Track trade limits per user
+    private userTradesExecuted: Map<number, number> = new Map(); // Track trades executed per user
+    private userScanningPaused: Set<number> = new Set(); // Track users whose scanning is paused
 
     constructor(config: SniperBotConfig) {
         this.botConfig = config;
@@ -131,19 +134,8 @@ export class SniperBot {
     // Handle token detection from enhanced scanner
     private async handleTokenDetected(tokenData: TokenData) {
         try {
-            console.log(`🎯 SniperBot received token detection: ${tokenData.symbol} on ${tokenData.network}`);
-            console.log(`📊 Token details:`, {
-                symbol: tokenData.symbol,
-                name: tokenData.name,
-                price: tokenData.price,
-                liquidity: tokenData.liquidity,
-                volume24h: tokenData.volume24h,
-                age: tokenData.age,
-                ageSeconds: tokenData.ageSeconds
-            });
-
-            // Send token detection message to ALL users who have configurations
             for (const [userId, userConfig] of this.userConfigs) {
+                if (this.userScanningPaused.has(userId)) continue; // Skip scanning for this user if paused
                 console.log(`📱 Processing token for user ${userId}`);
                 
                 await this.botConfig.onLog(
@@ -229,6 +221,12 @@ export class SniperBot {
     // Attempt to snipe a detected token
     private async attemptSnipe(userId: number, tokenData: TokenData) {
         try {
+            if (!this.canUserTrade(userId)) {
+                await this.botConfig.onLog(`⚠️ Trade limit reached. No more snipes will be executed.`, userId);
+                this.userScanningPaused.add(userId); // Only pause scanning, do not stop monitoring
+                return;
+            }
+            this.incrementUserTradesExecuted(userId);
             console.log(`🚀 Starting snipe attempt for ${tokenData.symbol} (${tokenData.address}) on ${tokenData.network} for user ${userId}`);
             
             const userConfig = this.getUserConfig(userId);
@@ -536,6 +534,7 @@ export class SniperBot {
 
     // --- AUTO SCAN FUNCTION ---
     async startBackgroundMonitoring(userId: number) {
+        this.userScanningPaused.delete(userId); // Always resume scanning for this user
         if (this.monitoringIntervals.has(userId)) {
             this.botConfig.onLog('Sniper Bot is already running in background for this user.', userId);
             return;
@@ -1155,5 +1154,41 @@ export class SniperBot {
         } catch (error) {
             throw error;
         }
+    }
+
+    // Set trade limit for a user
+    setUserTradeLimit(userId: number, limit: number) {
+        this.userTradeLimits.set(userId, limit);
+        this.userTradesExecuted.set(userId, 0);
+        this.userScanningPaused.delete(userId); // Resume scanning if limit is set again
+    }
+
+    // Get trade limit for a user
+    getUserTradeLimit(userId: number): number | undefined {
+        return this.userTradeLimits.get(userId);
+    }
+
+    // Get trades executed for a user
+    getUserTradesExecuted(userId: number): number {
+        return this.userTradesExecuted.get(userId) || 0;
+    }
+
+    // Reset trades executed for a user
+    resetUserTradesExecuted(userId: number) {
+        this.userTradesExecuted.set(userId, 0);
+    }
+
+    // Increment trades executed for a user
+    private incrementUserTradesExecuted(userId: number) {
+        const executed = this.userTradesExecuted.get(userId) || 0;
+        this.userTradesExecuted.set(userId, executed + 1);
+    }
+
+    // Check if user can trade
+    private canUserTrade(userId: number): boolean {
+        const limit = this.userTradeLimits.get(userId);
+        if (limit === undefined) return true;
+        const executed = this.userTradesExecuted.get(userId) || 0;
+        return executed < limit;
     }
 }

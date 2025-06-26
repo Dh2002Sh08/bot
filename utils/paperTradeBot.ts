@@ -34,6 +34,7 @@ interface PaperWallet {
     network: 'ETH' | 'BSC' | 'SOL';
     balance: number;
     tokens: Map<string, PaperTokenPosition>;
+    isActive: boolean;
 }
 
 export class PaperTradeBot {
@@ -54,6 +55,9 @@ export class PaperTradeBot {
     private activeUsers: Set<number> = new Set(); // Track active users
     private activeStatusIntervals: Map<number, NodeJS.Timeout> = new Map(); // Track status message intervals
     private solanaPriceCache: Map<string, number> = new Map(); // Cache for SOL token prices
+    private userTradeLimits: Map<number, number> = new Map(); // Track trade limits per user
+    private userTradesExecuted: Map<number, number> = new Map(); // Track trades executed per user
+    private userScanningPaused: Set<number> = new Set(); // Track users whose scanning is paused
 
     // Dummy coin amounts for paper trading
     private readonly DUMMY_BALANCES = {
@@ -110,6 +114,7 @@ export class PaperTradeBot {
             // Only send token detection to active users
             for (const [userId, userConfig] of this.userConfigs) {
                 if (!this.activeUsers.has(userId)) continue;
+                if (this.userScanningPaused.has(userId)) continue; // Skip scanning for this user if paused
                 console.log(`📱 Processing paper trade for user ${userId}`);
                 
                 await this.botConfig.onLog(
@@ -347,6 +352,12 @@ export class PaperTradeBot {
     // Attempt to paper trade a detected token
     private async attemptPaperTrade(userId: number, tokenData: TokenData) {
         try {
+            if (!this.canUserTrade(userId)) {
+                await this.botConfig.onLog(`⚠️ Trade limit reached. No more trades will be executed.`, userId);
+                this.userScanningPaused.add(userId); // Only pause scanning, do not stop monitoring
+                return;
+            }
+            this.incrementUserTradesExecuted(userId);
             console.log(`🚀 Starting paper trade attempt for ${tokenData.symbol} (${tokenData.address}) on ${tokenData.network} for user ${userId}`);
             
             const userConfig = this.getUserConfig(userId);
@@ -485,7 +496,8 @@ export class PaperTradeBot {
                 privateKey: Buffer.from(keypair.secretKey).toString('hex'),
                 network: 'SOL',
                 balance: this.DUMMY_BALANCES.SOL,
-                tokens: new Map()
+                tokens: new Map(),
+                isActive: true
             };
         } else {
             const ethersWallet = ethers.Wallet.createRandom();
@@ -494,7 +506,8 @@ export class PaperTradeBot {
                 privateKey: ethersWallet.privateKey,
                 network: network,
                 balance: network === 'ETH' ? this.DUMMY_BALANCES.ETH : this.DUMMY_BALANCES.BSC,
-                tokens: new Map()
+                tokens: new Map(),
+                isActive: true
             };
         }
 
@@ -612,12 +625,13 @@ export class PaperTradeBot {
 
     // Start paper trading monitoring
     async startPaperTrading(userId: number) {
+        this.userScanningPaused.delete(userId); // Always resume scanning for this user
+        this.activeUsers.add(userId); // Ensure user is active
         if (this.isRunning) {
             await this.botConfig.onLog('⚠️ Paper Trading is already running!', userId);
             return;
         }
 
-        this.activeUsers.add(userId); // Mark user as active
         const hasEthWallet = this.hasUserWallet(userId, 'ETH');
         const hasBscWallet = this.hasUserWallet(userId, 'BSC');
         const hasSolWallet = this.hasUserWallet(userId, 'SOL');
@@ -716,7 +730,8 @@ export class PaperTradeBot {
     stopPaperTrading(userId: number) {
         this.isRunning = false;
         this.stopFlag = true;
-        this.activeUsers.delete(userId); // Remove user from active set
+        this.activeUsers.delete(userId);
+        this.userScanningPaused.delete(userId);
         const monitoringInterval = this.monitoringIntervals.get(userId);
         if (monitoringInterval) {
             clearInterval(monitoringInterval);
@@ -748,6 +763,9 @@ export class PaperTradeBot {
         }
         this.botConfig.onLog('🛑 Paper Trading Bot stopped.', userId);
         console.log(`[STOP] Paper trading stopped for user ${userId}`);
+        if (this.activeUsers.size === 0 && this.enhancedTokenScanner) {
+            this.enhancedTokenScanner.stopScanning();
+        }
     }
 
     // Monitor for new tokens to snipe
@@ -1184,34 +1202,13 @@ export class PaperTradeBot {
     }
 
     // Activate or deactivate a paper wallet for a user and network
-    setPaperWalletActive(userId: number, network: 'ETH' | 'BSC' | 'SOL', active: boolean) {
-        const wallet = this.getUserWallet(userId, network);
-        if (!wallet) return;
-        (wallet as any).isActive = active;
-
-        // If the bot is running for this user, update the scanner's networks
-        if (this.isRunning && this.activeUsers.has(userId) && this.enhancedTokenScanner) {
-            // Determine which networks should be scanned now
-            const ethWallet = this.getUserWallet(userId, 'ETH');
-            const bscWallet = this.getUserWallet(userId, 'BSC');
-            const solWallet = this.getUserWallet(userId, 'SOL');
-            const ethActive = ethWallet && (ethWallet as any).isActive !== false;
-            const bscActive = bscWallet && (bscWallet as any).isActive !== false;
-            const solActive = solWallet && (solWallet as any).isActive !== false;
-            const networksToScan: ('ETH' | 'BSC' | 'SOL')[] = [];
-            if (ethActive) networksToScan.push('ETH');
-            if (bscActive) networksToScan.push('BSC');
-            if (solActive) networksToScan.push('SOL');
-            // Restart the scanner with the new set of networks
-            if (this.enhancedTokenScanner.isScanning()) {
-                this.enhancedTokenScanner.stopScanning();
-            }
-            if (networksToScan.length > 0) {
-                this.enhancedTokenScanner.startScanning(networksToScan);
-            }
+    setPaperWalletActive(userId: number, network: 'ETH' | 'BSC' | 'SOL', isActive: boolean) {
+        const wallets = this.userWallets.get(userId);
+        if (!wallets || !wallets.get(network)) return;
+        wallets.get(network)!.isActive = isActive;
+        if (!this.hasAnyActivePaperWallet(userId)) {
+            this.stopPaperTrading(userId);
         }
-        // Immediately update the status message
-        this.sendActiveStatusMessage(userId);
     }
 
     // Force stop all paper trading and scanner for all users
@@ -1238,5 +1235,52 @@ export class PaperTradeBot {
         this.positionMonitoringIntervals.clear();
         this.activeStatusIntervals.clear();
         console.log('[FORCE STOP] All intervals and scanner stopped.');
+    }
+
+    // Set trade limit for a user
+    setUserTradeLimit(userId: number, limit: number) {
+        this.userTradeLimits.set(userId, limit);
+        this.userTradesExecuted.set(userId, 0);
+        this.userScanningPaused.delete(userId); // Resume scanning if limit is set again
+    }
+
+    // Get trade limit for a user
+    getUserTradeLimit(userId: number): number | undefined {
+        return this.userTradeLimits.get(userId);
+    }
+
+    // Get trades executed for a user
+    getUserTradesExecuted(userId: number): number {
+        return this.userTradesExecuted.get(userId) || 0;
+    }
+
+    // Increment trades executed for a user
+    private incrementUserTradesExecuted(userId: number) {
+        const executed = this.userTradesExecuted.get(userId) || 0;
+        this.userTradesExecuted.set(userId, executed + 1);
+    }
+
+    // Check if user can trade
+    private canUserTrade(userId: number): boolean {
+        const limit = this.userTradeLimits.get(userId);
+        if (limit === undefined) return true;
+        const executed = this.userTradesExecuted.get(userId) || 0;
+        return executed < limit;
+    }
+
+    // Reset trades executed for a user
+    resetUserTradesExecuted(userId: number) {
+        this.userTradesExecuted.set(userId, 0);
+    }
+
+    isPaperWalletActive(userId: number, network: 'ETH' | 'BSC' | 'SOL'): boolean {
+        const wallet = this.getUserWallet(userId, network);
+        return wallet ? wallet.isActive : false;
+    }
+
+    hasAnyActivePaperWallet(userId: number): boolean {
+        const wallets = this.userWallets.get(userId);
+        if (!wallets) return false;
+        return Array.from(wallets.values()).some(w => w.isActive);
     }
 }
